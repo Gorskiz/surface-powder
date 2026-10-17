@@ -10,17 +10,28 @@ not include the original game's source or assets.
 
 ## Features
 
-- 400×300 simulation with 20 materials/tools and a large touch-friendly palette.
-- Powder, water, fire, seeds, wood, gunpowder, oil, stone, magma, ice, steam,
-  acid, metal, sparks, gas, clones and walls.
+- 400×300 simulation with **50 materials and tools**, arranged across three palette pages.
+- A coarse wind/pressure field that pushes particles and interacts with obstacles.
+- Directional fans and pumps; explosions generate pressure and can shatter glass.
+- Anchored spinning wheels, tumbling boxes, material-carrying balls, and floating bubbles.
 - Controllable players and autonomous fighters.
-- Adjustable brushes, neon trails, pause and a starter scene.
-- Automatic scene persistence, including when the app exits gracefully.
-- Native fullscreen rendering at approximately 30 frames per second.
+- Brush sizing, neon trails, airflow view, touch controls, and an interactive starter scene.
+- Automatic scene persistence, including wind and object state.
+- Native rendering capped at approximately 30 frames per second.
 - No browser, game engine, account or network connection required to play.
 
-The original game's wind, wheels, boxes, bubbles, remaining materials, save
-format and online sharing are not implemented.
+The palette includes powder, water, fire, seeds, gunpowder, fans, ice,
+superballs, clones, fireworks, oil, C-4, stone, magma, virus, nitro, ants,
+torches, gas, soapy water, thunder, metal, bombs, lasers, acid, vines, salt,
+glass, birds, mercury, sparks, fuses, clouds and pumps, plus wood, steam,
+saltwater and snow. Tools include Wind, Air, Drag, Bubble, Wheel, Player,
+Fighter, Box, Ball, Create, Wall and Erase.
+
+This remains an independent approximation of the original. Air uses 4-pixel
+tiles, box-to-box collision uses conservative bounding circles, and bubbles
+use a deforming film rather than sealed fluid volumes. Create currently
+reuses the clone material behavior. Original saves, online sharing, copy/paste
+and the original game's complete UI/interaction rules are not supported.
 
 ## Build and run
 
@@ -54,7 +65,11 @@ RUSTFLAGS="-L native=$(brew --prefix sdl2)/lib" cargo run --release --locked
 | Input | Action |
 | --- | --- |
 | Touch, pen or left mouse drag | Paint selected material |
-| Right mouse drag | Erase |
+| Right mouse drag | Paint secondary material (Erase by default) |
+| Set R, then a palette material | Choose secondary material using touch |
+| Right-click a palette material | Choose secondary material using a mouse |
+| Palette ‹ / ›, Tab, Page Up / Page Down | Browse palette pages |
+| F / Flow | Show air velocity and pressure |
 | Mouse wheel or − / + | Change brush size |
 | Arrow keys or A / D / W | Move and jump with player stickmen |
 | On-screen arrows / Jump | Touch controls for stickmen |
@@ -65,7 +80,21 @@ RUSTFLAGS="-L native=$(brew --prefix sdl2)/lib" cargo run --release --locked
 | Demo | Replace the current scene with the starter scene |
 | Escape | Save and exit |
 
-Player and Fighter tools create one stickman per press. The Demo button
+Player, Fighter, Wheel, Box and Ball create one object per press. Draw a loop
+with Bubble and release to create a sized bubble. Drag the rim of a wheel to
+spin it, or drag a box/ball to throw it. Wind follows the direction of your
+stroke; a held stationary wind brush keeps blowing in that direction. Fans
+and pumps take their direction from the stroke used to place them.
+
+Air raises pressure; right-clicking with Air lowers it. On touch, use the
+Air + / Air − button beside Flow to switch between pressure and suction. Set R chooses a
+material payload for subsequently placed fireworks and balls, as well as the
+right mouse brush. Selecting Erase as the secondary resets payloads to powder.
+Fireworks launch when ignited; balls release their payload on impact. The
+Flow overlay shows velocity arrows, green positive pressure and blue negative
+pressure. The default demo includes a fan-driven gear and movable objects.
+
+The Demo button
 replaces the current world immediately; it is not an additional save slot.
 
 ## Saves
@@ -75,7 +104,9 @@ SIGINT or SIGTERM. It reloads at startup.
 
 Default location: `~/.local/state/surface-powder/world.bin`. Setting
 `XDG_STATE_HOME` moves it to `$XDG_STATE_HOME/surface-powder/world.bin`.
-Corrupt or incompatible saves are preserved and reported rather than
+Version 1 saves load automatically; the first upgraded save creates a
+`world.bin.v1.bak` copy. Version 2 saves retain pressure, velocity, bodies and
+material payloads. Corrupt or incompatible saves are preserved and reported rather than
 overwritten. To start fresh, move the save file aside.
 
 ## Development
@@ -88,8 +119,9 @@ cargo run --release --locked -- --benchmark
 ```
 
 On macOS, use the same `RUSTFLAGS` setting from the build command for commands
-that link the executable. Tests cover particle conservation, liquid barriers,
-material reactions, conductive sparks, actors, save/load, and input mapping.
+that link the executable. Tests cover particle conservation, barriers, pressure transport, wheel torque,
+body collision, bubble popping, material payloads, chemistry, electricity,
+legacy-save migration, deterministic save/load continuation and touch input.
 
 For a headless rendering check:
 
@@ -102,10 +134,11 @@ On Unix, SIGUSR1 captures `preview.ppm` alongside the saved world.
 
 ## Performance
 
-On a Surface Pro 4 (i5-6300U, Debian 13), a starter-scene benchmark measured
-about 2 ms per simulation and pixel-render step. The running game measured
-approximately 56 MiB proportional memory (PSS). These are sample measurements,
-not guarantees for every scene, graphics driver or machine.
+The simulation keeps compact two-byte cells, a coarse air grid, and a maximum
+of 128 moving objects. It does not add physics-engine dependencies. Use
+`--benchmark` to measure simulation plus pixel rendering on your hardware;
+that benchmark excludes SDL presentation and UI drawing. Large active scenes
+can reduce frame rate on older hardware.
 
 ## License
 

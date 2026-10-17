@@ -1,4 +1,5 @@
 mod font;
+mod physics;
 mod sim;
 
 use sdl2::{
@@ -84,10 +85,21 @@ enum Action {
     Left,
     Right,
     Jump,
+    PreviousPage,
+    NextPage,
+    Flow,
+    SecondaryMode,
+    PressureSign,
 }
-fn controls() -> Vec<(Rect, Action)> {
+const PAGE_SIZE: usize = 20;
+fn page_count() -> usize {
+    Material::ALL.len().div_ceil(PAGE_SIZE)
+}
+fn controls(page: usize) -> Vec<(Rect, Action)> {
     let mut v: Vec<_> = Material::ALL
         .iter()
+        .skip(page * PAGE_SIZE)
+        .take(PAGE_SIZE)
         .enumerate()
         .map(|(i, m)| {
             (
@@ -97,6 +109,11 @@ fn controls() -> Vec<(Rect, Action)> {
         })
         .collect();
     for (rect, action) in [
+        (Rect::new(320, 14, 120, 32), Action::SecondaryMode),
+        (Rect::new(16, 94, 40, 24), Action::PreviousPage),
+        (Rect::new(162, 94, 40, 24), Action::NextPage),
+        (Rect::new(1080, 76, 84, 32), Action::Flow),
+        (Rect::new(960, 76, 110, 32), Action::PressureSign),
         (Rect::new(16, 594, 90, 40), Action::Pause),
         (Rect::new(112, 594, 90, 40), Action::Glow),
         (Rect::new(16, 640, 90, 40), Action::Demo),
@@ -135,13 +152,48 @@ fn save_world(w: &World, path: &PathBuf) -> String {
         }
     }
 }
+#[derive(Clone, Copy)]
+struct Stroke {
+    material: Material,
+    last: (i32, i32),
+    min: (i32, i32),
+    max: (i32, i32),
+    direction: (i32, i32),
+    pressure: f32,
+}
+impl Stroke {
+    fn new(material: Material, p: (i32, i32), negative: bool) -> Self {
+        Self {
+            material,
+            last: p,
+            min: p,
+            max: p,
+            direction: (1, 0),
+            pressure: if negative { -0.8 } else { 0.8 },
+        }
+    }
+    fn circle(&self, brush: i32) -> (i32, i32, i32) {
+        (
+            (self.min.0 + self.max.0) / 2,
+            (self.min.1 + self.max.1) / 2,
+            ((self.max.0 - self.min.0).max(self.max.1 - self.min.1) / 2)
+                .max(brush + 4)
+                .clamp(3, 48),
+        )
+    }
+}
 struct App {
     world: World,
     material: Material,
+    secondary: Material,
+    select_secondary: bool,
+    negative_pressure: bool,
+    page: usize,
     radius: i32,
     paused: bool,
     glow: bool,
-    pointers: HashMap<i64, (i32, i32)>,
+    flow: bool,
+    pointers: HashMap<i64, Stroke>,
     mouse: Option<(i32, i32)>,
     erasing: bool,
     held: HashMap<i64, Action>,
@@ -149,14 +201,22 @@ struct App {
     notice_until: Instant,
     clear_until: Option<Instant>,
 }
+fn one_shot(m: Material) -> bool {
+    m.is_object() || matches!(m, Material::Player | Material::Fighter)
+}
 impl App {
     fn new(world: World) -> Self {
         Self {
             world,
             material: Material::Sand,
+            secondary: Material::Empty,
+            select_secondary: false,
+            negative_pressure: false,
+            page: 0,
             radius: 3,
             paused: false,
             glow: true,
+            flow: false,
             pointers: HashMap::new(),
             mouse: None,
             erasing: false,
@@ -170,9 +230,34 @@ impl App {
         self.notice = s;
         self.notice_until = Instant::now() + Duration::from_secs(3);
     }
+    fn change_page(&mut self, delta: isize) {
+        self.page = (self.page as isize + delta).rem_euclid(page_count() as isize) as usize;
+    }
+    fn pour(&mut self, stroke: Stroke) {
+        let p = stroke.last;
+        match stroke.material {
+            Material::Air => self
+                .world
+                .apply_pressure(p.0, p.1, self.radius * 3, stroke.pressure),
+            Material::Wind => self.world.paint_line(
+                p.0,
+                p.1,
+                p.0 + stroke.direction.0,
+                p.1 + stroke.direction.1,
+                self.radius,
+                Material::Wind,
+            ),
+            Material::Drag => {}
+            m if one_shot(m) => {}
+            m => self.world.paint_line(p.0, p.1, p.0, p.1, self.radius, m),
+        }
+    }
     fn press(&mut self, id: i64, x: i32, y: i32, buttons: &[(Rect, Action)], path: &PathBuf) {
         self.clear_until = self.clear_until.filter(|t| *t > Instant::now());
         for (r, a) in buttons {
+            if *a == Action::PressureSign && self.material != Material::Air {
+                continue;
+            }
             if matches!(a, Action::Left | Action::Right | Action::Jump)
                 && self.world.actors.is_empty()
             {
@@ -181,10 +266,31 @@ impl App {
             if r.contains_point(Point::new(x, y)) {
                 match *a {
                     Action::Select(m) => {
-                        self.material = m;
+                        if self.select_secondary && !m.is_cell() {
+                            self.notify("CHOOSE A MATERIAL".into());
+                        } else if (self.erasing || self.select_secondary) && m.is_cell() {
+                            self.secondary = m;
+                            if m != Material::Empty {
+                                self.world.brush_payload = m;
+                            }
+                            self.select_secondary = false;
+                            self.notify(format!("SECONDARY: {}", m.name()));
+                        } else {
+                            self.material = m;
+                        }
                     }
                     Action::Pause => self.paused = !self.paused,
                     Action::Glow => self.glow = !self.glow,
+                    Action::Flow => self.flow = !self.flow,
+                    Action::PressureSign => self.negative_pressure = !self.negative_pressure,
+                    Action::SecondaryMode => {
+                        self.select_secondary = !self.select_secondary;
+                        if self.select_secondary {
+                            self.notify("CHOOSE R MATERIAL".into());
+                        }
+                    }
+                    Action::PreviousPage => self.change_page(-1),
+                    Action::NextPage => self.change_page(1),
                     Action::Demo => {
                         self.world.seed_demo();
                         self.notify("DEMO LOADED".into());
@@ -212,47 +318,68 @@ impl App {
             }
         }
         if let Some(p) = grid(x, y) {
-            self.world.paint_line(
-                p.0,
-                p.1,
-                p.0,
-                p.1,
-                self.radius,
-                if self.erasing {
-                    Material::Empty
-                } else {
-                    self.material
-                },
-            );
-            self.pointers.insert(id, p);
+            let m = if self.erasing && self.material != Material::Air {
+                self.secondary
+            } else {
+                self.material
+            };
+            let stroke = Stroke::new(m, p, self.erasing || self.negative_pressure);
+            if one_shot(m) && m != Material::Bubble {
+                self.world.paint_line(
+                    p.0,
+                    p.1,
+                    p.0,
+                    p.1,
+                    if m.is_object() {
+                        self.radius + 5
+                    } else {
+                        self.radius
+                    },
+                    m,
+                );
+            } else if m != Material::Bubble {
+                self.pour(stroke);
+            }
+            self.pointers.insert(id, stroke);
         }
     }
     fn drag(&mut self, id: i64, x: i32, y: i32) {
         if let Some(p) = grid(x, y) {
-            if let Some(prev) = self.pointers.get_mut(&id) {
-                // Actor tools spawn once per press, rather than a stickman per motion sample.
-                if !matches!(self.material, Material::Player | Material::Fighter) || self.erasing {
-                    self.world.paint_line(
-                        prev.0,
-                        prev.1,
-                        p.0,
-                        p.1,
-                        self.radius,
-                        if self.erasing {
-                            Material::Empty
-                        } else {
-                            self.material
-                        },
-                    );
+            if let Some(stroke) = self.pointers.get_mut(&id) {
+                let prev = stroke.last;
+                let dx = p.0 - prev.0;
+                let dy = p.1 - prev.1;
+                stroke.min = (stroke.min.0.min(p.0), stroke.min.1.min(p.1));
+                stroke.max = (stroke.max.0.max(p.0), stroke.max.1.max(p.1));
+                if dx != 0 || dy != 0 {
+                    stroke.direction = (dx.clamp(-12, 12), dy.clamp(-12, 12));
                 }
-                *prev = p;
+                match stroke.material {
+                    Material::Drag => {
+                        self.world
+                            .drag_at(prev.0, prev.1, dx, dy, self.radius * 2 + 5)
+                    }
+                    Material::Air => {
+                        self.world
+                            .apply_pressure(p.0, p.1, self.radius * 3, stroke.pressure)
+                    }
+                    m if !one_shot(m) => {
+                        self.world
+                            .paint_line(prev.0, prev.1, p.0, p.1, self.radius, m)
+                    }
+                    _ => {}
+                }
+                stroke.last = p;
             }
-        } else {
-            self.pointers.remove(&id);
         }
     }
     fn release(&mut self, id: i64) {
-        self.pointers.remove(&id);
+        if let Some(stroke) = self.pointers.remove(&id) {
+            if stroke.material == Material::Bubble {
+                let (x, y, r) = stroke.circle(self.radius);
+                self.world.paint_line(x, y, x, y, r, Material::Bubble);
+            }
+        }
         self.held.remove(&id);
     }
 }
@@ -278,13 +405,95 @@ fn draw(
     c.set_draw_color(rgb(0x090d14));
     c.clear();
     text(c, 16, 18, "SURFACE POWDER", 0x72ffc0, 3);
-    text(c, 680, 23, "SPACE: PAUSE  G: GLOW", 0x8294ad, 2);
+    text(c, 680, 23, "TAB: TOOLS  G: GLOW  F: FLOW", 0x8294ad, 2);
     text(c, 16, 68, app.material.name(), app.material.color(), 2);
-    text(c, 16, 94, &format!("{} DOTS", count), 0x8294ad, 1);
+    if matches!(app.material, Material::Firework | Material::Ball) {
+        text(
+            c,
+            236,
+            48,
+            &format!("PAYLOAD: {}", app.world.brush_payload.name()),
+            0xd697f5,
+            1,
+        );
+    }
+    text(
+        c,
+        16,
+        48,
+        &format!("R: {}", app.secondary.name()),
+        0xd697f5,
+        1,
+    );
+    text(
+        c,
+        72,
+        101,
+        &format!("{}/{}", app.page + 1, page_count()),
+        0x8294ad,
+        1,
+    );
     c.set_draw_color(rgb(0x354050));
     c.draw_rect(Rect::new(218, 62, 964, 724))?;
     c.copy(texture, None, field())?;
+    text(
+        c,
+        236,
+        76,
+        &format!("{} DOTS  {} OBJECTS", count, app.world.bodies.len()),
+        0x8294ad,
+        1,
+    );
+    if app.flow || matches!(app.material, Material::Wind | Material::Air | Material::Fan) {
+        for y in (8..HEIGHT).step_by(16) {
+            for x in (8..WIDTH).step_by(16) {
+                let (vx, vy, p) = app.world.air.sample(x as f32, y as f32);
+                if vx.abs() + vy.abs() + p.abs() < 0.03 {
+                    continue;
+                }
+                c.set_draw_color(rgb(if p > 0.1 {
+                    0x3ea784
+                } else if p < -0.1 {
+                    0x5e72c9
+                } else {
+                    0x315c6b
+                }));
+                let sx = field().x() + (x as f32 * 2.4) as i32;
+                let sy = field().y() + (y as f32 * 2.4) as i32;
+                c.draw_line(
+                    Point::new(sx, sy),
+                    Point::new(
+                        sx + (vx * 8.).clamp(-18., 18.) as i32,
+                        sy + (vy * 8.).clamp(-18., 18.) as i32,
+                    ),
+                )?;
+                c.fill_rect(Rect::new(sx, sy, 2, 2))?;
+            }
+        }
+    }
+    for stroke in app
+        .pointers
+        .values()
+        .filter(|s| s.material == Material::Bubble)
+    {
+        let (x, y, r) = stroke.circle(app.radius);
+        c.set_draw_color(rgb(0x70e6ef));
+        for n in 0..48 {
+            let a = n as f32 * std::f32::consts::TAU / 48.;
+            let b = (n + 1) as f32 * std::f32::consts::TAU / 48.;
+            let point = |angle: f32| {
+                Point::new(
+                    field().x() + ((x as f32 + angle.cos() * r as f32) * 2.4) as i32,
+                    field().y() + ((y as f32 + angle.sin() * r as f32) * 2.4) as i32,
+                )
+            };
+            c.draw_line(point(a), point(b))?;
+        }
+    }
     for (rect, action) in buttons {
+        if *action == Action::PressureSign && app.material != Material::Air {
+            continue;
+        }
         let (label, color, active) = match action {
             Action::Select(m) => (
                 m.name(),
@@ -317,6 +526,27 @@ fn draw(
             Action::Left => ("<", 0x72ffc0, app.held.values().any(|a| a == action)),
             Action::Right => (">", 0x72ffc0, app.held.values().any(|a| a == action)),
             Action::Jump => ("JUMP", 0x72ffc0, app.held.values().any(|a| a == action)),
+            Action::PreviousPage => ("<", 0xb5c4d9, false),
+            Action::NextPage => (">", 0xb5c4d9, false),
+            Action::Flow => ("FLOW", 0x70e6ef, app.flow),
+            Action::PressureSign => (
+                if app.negative_pressure {
+                    "AIR -"
+                } else {
+                    "AIR +"
+                },
+                0x70e6ef,
+                app.negative_pressure,
+            ),
+            Action::SecondaryMode => (
+                if app.select_secondary {
+                    "PICK R"
+                } else {
+                    "SET R"
+                },
+                0xd697f5,
+                app.select_secondary,
+            ),
         };
         if matches!(action, Action::Left | Action::Right | Action::Jump)
             && app.world.actors.is_empty()
@@ -324,12 +554,16 @@ fn draw(
             continue;
         }
         button(c, *rect, label, color, active);
+        if matches!(action,Action::Select(m) if *m==app.secondary && *m!=Material::Empty) {
+            c.set_draw_color(rgb(0xd697f5));
+            c.fill_rect(Rect::new(rect.right() - 7, rect.y() + 3, 4, 4))?;
+        }
     }
     text(c, 73, 758, &format!("PEN {}", app.radius), 0x8294ad, 1);
     if Instant::now() < app.notice_until {
         c.set_draw_color(rgb(0x111722));
-        c.fill_rect(Rect::new(750, 70, 420, 30))?;
-        text(c, 764, 78, &app.notice, 0x72ffc0, 2);
+        c.fill_rect(Rect::new(750, 116, 420, 30))?;
+        text(c, 764, 124, &app.notice, 0x72ffc0, 2);
     }
     Ok(())
 }
@@ -380,7 +614,6 @@ fn main() -> Result<(), String> {
         Err(e) => return Err(format!("Save could not be loaded (preserved): {e}")),
     };
     let mut app = App::new(world);
-    let buttons = controls();
     let mut events = ctx.event_pump()?;
     let mut pixels = vec![0u32; WIDTH * HEIGHT];
     let mut trails = vec![0u32; WIDTH * HEIGHT];
@@ -417,12 +650,27 @@ fn main() -> Result<(), String> {
                     repeat: false,
                     ..
                 } => app.glow = !app.glow,
+                Event::KeyDown {
+                    keycode: Some(Keycode::F),
+                    repeat: false,
+                    ..
+                } => app.flow = !app.flow,
+                Event::KeyDown {
+                    keycode: Some(Keycode::Tab | Keycode::PageDown),
+                    repeat: false,
+                    ..
+                } => app.change_page(1),
+                Event::KeyDown {
+                    keycode: Some(Keycode::PageUp),
+                    repeat: false,
+                    ..
+                } => app.change_page(-1),
                 Event::MouseButtonDown {
                     x, y, mouse_btn, ..
                 } => {
                     app.erasing = mouse_btn == MouseButton::Right;
                     app.mouse = Some((x, y));
-                    app.press(-1, x, y, &buttons, &path);
+                    app.press(-1, x, y, &controls(app.page), &path);
                 }
                 Event::MouseButtonUp { .. } => {
                     app.release(-1);
@@ -438,7 +686,7 @@ fn main() -> Result<(), String> {
                     finger_id, x, y, ..
                 } => {
                     let p = touch_point(x, y);
-                    app.press(finger_id, p.0, p.1, &buttons, &path);
+                    app.press(finger_id, p.0, p.1, &controls(app.page), &path);
                 }
                 Event::FingerMotion {
                     finger_id, x, y, ..
@@ -473,22 +721,9 @@ fn main() -> Result<(), String> {
         };
         if frame.duration_since(last_step) >= Duration::from_millis(32) {
             if !app.paused {
-                // Holding still keeps pouring; actors remain one-per-press.
-                if app.erasing || !matches!(app.material, Material::Player | Material::Fighter) {
-                    for p in app.pointers.values() {
-                        app.world.paint_line(
-                            p.0,
-                            p.1,
-                            p.0,
-                            p.1,
-                            app.radius,
-                            if app.erasing {
-                                Material::Empty
-                            } else {
-                                app.material
-                            },
-                        );
-                    }
+                let strokes: Vec<_> = app.pointers.values().copied().collect();
+                for stroke in strokes {
+                    app.pour(stroke);
                 }
                 app.world.step(input);
             }
@@ -522,7 +757,10 @@ fn main() -> Result<(), String> {
                 .filter(|c| c.material != Material::Empty)
                 .count();
         }
-        draw(&app, &mut c, &texture, &buttons, counts)?;
+        if app.clear_until.is_some_and(|t| t < Instant::now()) {
+            app.clear_until = None;
+        }
+        draw(&app, &mut c, &texture, &controls(app.page), counts)?;
         frames += 1;
         let finishing = max_frames.is_some_and(|n| frames >= n);
         if CAPTURE.swap(false, Ordering::Relaxed) || (finishing && screenshot.is_some()) {
@@ -590,17 +828,162 @@ mod tests {
     #[test]
     fn hidden_actor_buttons_do_not_intercept_painting() {
         let mut app = App::new(World::new(WIDTH, HEIGHT));
-        app.press(1, 250, 740, &controls(), &PathBuf::from("unused"));
+        app.press(1, 250, 740, &controls(0), &PathBuf::from("unused"));
         let (x, y) = grid(250, 740).unwrap();
         assert_eq!(app.world.at(x, y), Material::Sand);
         assert!(app.held.is_empty());
     }
     #[test]
-    fn palette_does_not_overlap_field() {
-        for (r, a) in controls() {
-            if matches!(a, Action::Select(_)) {
-                assert!(!r.has_intersection(field()));
+    fn all_palette_pages_are_reachable_without_overlapping_controls() {
+        let mut seen = std::collections::HashSet::new();
+        for page in 0..page_count() {
+            let buttons = controls(page);
+            for (r, a) in &buttons {
+                assert!(
+                    r.x() >= 0
+                        && r.y() >= 0
+                        && r.right() <= VIEW_W as i32
+                        && r.bottom() <= VIEW_H as i32
+                );
+                if let Action::Select(m) = a {
+                    assert!(!r.has_intersection(field()));
+                    assert!(seen.insert(*m as u8));
+                    for (other, other_action) in &buttons {
+                        if !matches!(other_action, Action::Select(_)) {
+                            assert!(!r.has_intersection(*other));
+                        }
+                    }
+                }
             }
         }
+        assert_eq!(seen.len(), Material::ALL.len());
+    }
+    #[test]
+    fn bubble_gesture_creates_one_sized_bubble_on_release() {
+        let mut app = App::new(World::new(WIDTH, HEIGHT));
+        app.material = Material::Bubble;
+        app.press(1, 700, 400, &controls(0), &PathBuf::from("unused"));
+        app.drag(1, 772, 472);
+        app.drag(1, 700, 400);
+        assert!(app.world.bodies.is_empty());
+        app.release(1);
+        assert_eq!(app.world.bodies.len(), 1);
+        assert_eq!(app.world.bodies[0].kind, physics::BodyKind::Bubble);
+        assert!((app.world.bodies[0].radius - 15.).abs() < 1.);
+    }
+    #[test]
+    fn holding_object_brush_does_not_create_a_body_every_frame() {
+        let mut app = App::new(World::new(WIDTH, HEIGHT));
+        app.material = Material::Box;
+        app.press(1, 700, 400, &controls(0), &PathBuf::from("unused"));
+        for _ in 0..30 {
+            let stroke = app.pointers[&1];
+            app.pour(stroke);
+        }
+        assert_eq!(app.world.bodies.len(), 1);
+    }
+    #[test]
+    fn air_secondary_stroke_lowers_pressure() {
+        let mut app = App::new(World::new(WIDTH, HEIGHT));
+        app.material = Material::Air;
+        app.erasing = true;
+        app.press(1, 700, 400, &controls(0), &PathBuf::from("unused"));
+        let (x, y) = grid(700, 400).unwrap();
+        assert!(app.world.air.sample(x as f32, y as f32).2 < 0.);
+        assert!(app
+            .world
+            .cells
+            .iter()
+            .all(|c| c.material == Material::Empty));
+    }
+    #[test]
+    fn selecting_secondary_material_sets_fireworks_payload_without_switching_tool() {
+        let mut app = App::new(World::new(WIDTH, HEIGHT));
+        app.material = Material::Firework;
+        app.erasing = true;
+        let buttons = controls(0);
+        let r = buttons
+            .iter()
+            .find(|(_, a)| *a == Action::Select(Material::Water))
+            .unwrap()
+            .0;
+        app.press(-1, r.x() + 5, r.y() + 5, &buttons, &PathBuf::from("unused"));
+        assert_eq!(app.material, Material::Firework);
+        assert_eq!(app.secondary, Material::Water);
+        app.erasing = false;
+        app.press(1, 700, 400, &buttons, &PathBuf::from("unused"));
+        let (x, y) = grid(700, 400).unwrap();
+        let cell = app.world.cells[y as usize * WIDTH + x as usize];
+        assert_eq!(cell.material, Material::Firework);
+        assert_eq!(cell.life & 63, Material::Water as u8);
+    }
+    #[test]
+    fn touch_can_choose_a_secondary_material_without_a_right_mouse_button() {
+        let mut app = App::new(World::new(WIDTH, HEIGHT));
+        let buttons = controls(0);
+        let set_r = buttons
+            .iter()
+            .find(|(_, a)| *a == Action::SecondaryMode)
+            .unwrap()
+            .0;
+        app.press(
+            1,
+            set_r.x() + 5,
+            set_r.y() + 5,
+            &buttons,
+            &PathBuf::from("unused"),
+        );
+        assert!(app.select_secondary);
+        let water = buttons
+            .iter()
+            .find(|(_, a)| *a == Action::Select(Material::Water))
+            .unwrap()
+            .0;
+        app.press(
+            2,
+            water.x() + 5,
+            water.y() + 5,
+            &buttons,
+            &PathBuf::from("unused"),
+        );
+        assert_eq!(app.secondary, Material::Water);
+        assert_eq!(app.material, Material::Sand);
+        assert_eq!(app.world.brush_payload, Material::Water);
+        assert!(!app.select_secondary);
+    }
+    #[test]
+    fn touch_can_switch_air_to_suction_without_a_mouse() {
+        let mut app = App::new(World::new(WIDTH, HEIGHT));
+        app.material = Material::Air;
+        let buttons = controls(0);
+        let toggle = buttons
+            .iter()
+            .find(|(_, a)| *a == Action::PressureSign)
+            .unwrap()
+            .0;
+        app.press(
+            1,
+            toggle.x() + 5,
+            toggle.y() + 5,
+            &buttons,
+            &PathBuf::from("unused"),
+        );
+        app.press(2, 700, 400, &buttons, &PathBuf::from("unused"));
+        let (x, y) = grid(700, 400).unwrap();
+        assert!(app.world.air.sample(x as f32, y as f32).2 < 0.);
+    }
+    #[test]
+    fn upward_wind_gesture_sets_upward_air_velocity() {
+        let mut app = App::new(World::new(WIDTH, HEIGHT));
+        app.material = Material::Wind;
+        app.press(1, 700, 400, &controls(0), &PathBuf::from("unused"));
+        app.drag(1, 700, 300);
+        let (x, y) = grid(700, 300).unwrap();
+        assert!(app.world.air.sample(x as f32, y as f32).1 < 0.);
+        assert!(app
+            .world
+            .cells
+            .iter()
+            .all(|c| c.material == Material::Empty));
     }
 }
