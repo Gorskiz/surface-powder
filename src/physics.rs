@@ -9,6 +9,17 @@ pub struct AirCell {
     pub pressure: f32,
 }
 
+const AIR_DIRECTIONS: [(isize, isize); 8] = [
+    (-1, 0),
+    (1, 0),
+    (0, -1),
+    (0, 1),
+    (-1, -1),
+    (1, -1),
+    (-1, 1),
+    (1, 1),
+];
+
 pub struct Air {
     pub cols: usize,
     pub rows: usize,
@@ -19,6 +30,9 @@ pub struct Air {
     // Four parallel pixel lanes per coarse face: thin walls seal, isolated dots do not.
     right_open: Vec<u8>,
     down_open: Vec<u8>,
+    obstacle_pixels: Vec<bool>,
+    obstacles_valid: bool,
+    neighbor_open: Vec<[u8; 8]>,
 }
 impl Air {
     pub fn new(width: usize, height: usize) -> Self {
@@ -34,6 +48,9 @@ impl Air {
             blocked: vec![false; cols * rows],
             right_open: vec![0; cols * rows],
             down_open: vec![0; cols * rows],
+            obstacle_pixels: vec![false; width * height],
+            obstacles_valid: false,
+            neighbor_open: vec![[0; 8]; cols * rows],
         }
     }
     pub fn clear(&mut self) {
@@ -97,6 +114,17 @@ impl Air {
         (result.vx, result.vy, result.pressure)
     }
     fn rebuild_obstacles(&mut self, width: usize, height: usize, cells: &[Cell]) {
+        let mut changed = !self.obstacles_valid || self.obstacle_pixels.len() != cells.len();
+        self.obstacle_pixels.resize(cells.len(), false);
+        for (pixel, cell) in self.obstacle_pixels.iter_mut().zip(cells) {
+            let occupied = solid(cell.material);
+            changed |= *pixel != occupied;
+            *pixel = occupied;
+        }
+        if !changed {
+            return;
+        }
+        self.obstacles_valid = true;
         let s = self.cell_size;
         for y in 0..self.rows {
             for x in 0..self.cols {
@@ -106,7 +134,7 @@ impl Air {
                 for py in y * s..((y + 1) * s).min(height) {
                     for px in x * s..((x + 1) * s).min(width) {
                         total += 1;
-                        occupied += usize::from(solid(cells[py * width + px].material));
+                        occupied += usize::from(self.obstacle_pixels[py * width + px]);
                     }
                 }
                 self.blocked[i] = occupied * 4 >= total * 3;
@@ -117,7 +145,7 @@ impl Air {
                 if x + 1 < self.cols {
                     for py in y * s..((y + 1) * s).min(height) {
                         if (x * s + s / 2..((x + 1) * s + s / 2 + 1).min(width))
-                            .all(|px| !solid(cells[py * width + px].material))
+                            .all(|px| !self.obstacle_pixels[py * width + px])
                         {
                             right += 1;
                         }
@@ -126,7 +154,7 @@ impl Air {
                 if y + 1 < self.rows {
                     for px in x * s..((x + 1) * s).min(width) {
                         if (y * s + s / 2..((y + 1) * s + s / 2 + 1).min(height))
-                            .all(|py| !solid(cells[py * width + px].material))
+                            .all(|py| !self.obstacle_pixels[py * width + px])
                         {
                             down += 1;
                         }
@@ -134,6 +162,19 @@ impl Air {
                 }
                 self.right_open[i] = right;
                 self.down_open[i] = down;
+            }
+        }
+        for y in 0..self.rows {
+            for x in 0..self.cols {
+                let i = y * self.cols + x;
+                for (direction, (dx, dy)) in AIR_DIRECTIONS.into_iter().enumerate() {
+                    let opening = if dx != 0 && dy != 0 {
+                        self.diagonal_face(x, y, dx, dy)
+                    } else {
+                        self.face(x, y, dx, dy)
+                    };
+                    self.neighbor_open[i][direction] = (opening * s as f32) as u8;
+                }
             }
         }
     }
@@ -202,11 +243,18 @@ impl Air {
                 };
                 for (dx, dy, speed) in [(major_x, major_y, major), (sx, sy, minor)] {
                     let fraction = 0.48 * speed / total;
-                    let opening = if dx != 0 && dy != 0 {
-                        self.diagonal_face(x, y, dx, dy)
-                    } else {
-                        self.face(x, y, dx, dy)
+                    let direction = match (dx, dy) {
+                        (-1, 0) => 0,
+                        (1, 0) => 1,
+                        (0, -1) => 2,
+                        (0, 1) => 3,
+                        (-1, -1) => 4,
+                        (1, -1) => 5,
+                        (-1, 1) => 6,
+                        (1, 1) => 7,
+                        _ => unreachable!(),
                     };
+                    let opening = self.neighbor_open[i][direction] as f32 / self.cell_size as f32;
                     let moved = fraction * opening;
                     // Momentum hitting a wall is absorbed; parallel flow survives.
                     self.scratch[i].vx -= c.vx * fraction;
@@ -231,22 +279,9 @@ impl Air {
                     continue;
                 }
                 let c = self.nodes[i];
-                for (dx, dy) in [
-                    (-1, 0),
-                    (1, 0),
-                    (0, -1),
-                    (0, 1),
-                    (-1, -1),
-                    (1, -1),
-                    (-1, 1),
-                    (1, 1),
-                ] {
-                    let diagonal = dx != 0 && dy != 0;
-                    let opening = if diagonal {
-                        self.diagonal_face(x, y, dx, dy)
-                    } else {
-                        self.face(x, y, dx, dy)
-                    };
+                for (direction, (dx, dy)) in AIR_DIRECTIONS.into_iter().enumerate() {
+                    let diagonal = direction >= 4;
+                    let opening = self.neighbor_open[i][direction] as f32 / self.cell_size as f32;
                     if opening == 0. {
                         continue;
                     }
@@ -788,6 +823,37 @@ mod tests {
         }
         assert!(a.sample(38., 30.).0 > 0.);
         assert!(a.sample(30., 30.).0 < initial);
+    }
+    #[test]
+    fn obstacle_cache_matches_rebuilt_solver_when_walls_change() {
+        let mut cells = vec![Cell::default(); 64 * 64];
+        let mut cached = Air::new(64, 64);
+        let mut rebuilt = Air::new(64, 64);
+        for air in [&mut cached, &mut rebuilt] {
+            air.add_wind(14., 30., 8., 3., 8.);
+            air.add_pressure(14., 30., 12., 8.);
+        }
+        for tick in 0..36 {
+            if tick == 8 || tick == 20 {
+                for y in 0..64 {
+                    cells[y * 64 + 32] = if tick == 8 {
+                        Cell::new(Material::Wall)
+                    } else {
+                        Cell::default()
+                    };
+                }
+            }
+            rebuilt.obstacles_valid = false;
+            cached.step(64, 64, &cells);
+            rebuilt.step(64, 64, &cells);
+            assert_eq!(cached.nodes, rebuilt.nodes);
+            assert_eq!(cached.neighbor_open, rebuilt.neighbor_open);
+            if tick == 8 {
+                assert_eq!(cached.right_open[7 * cached.cols + 7], 0);
+            } else if tick == 20 {
+                assert_eq!(cached.right_open[7 * cached.cols + 7], 4);
+            }
+        }
     }
     #[test]
     fn sampling_interpolates_between_coarse_centers() {
