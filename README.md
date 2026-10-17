@@ -11,13 +11,13 @@ not include the original game's source or assets.
 ## Features
 
 - 400×300 simulation with **50 materials and tools**, arranged across three palette pages.
-- A coarse wind/pressure field that pushes particles and interacts with obstacles.
-- Directional fans and pumps; explosions generate pressure and can shatter glass.
+- Momentum-carrying wind and pressure waves with smooth sampling and obstacle deflection.
+- Directional fans and pumps; explosions throw particles, bodies and characters outward.
 - Anchored spinning wheels, tumbling boxes, material-carrying balls, and floating bubbles.
-- Controllable players and autonomous fighters.
+- Six-joint players and fighters with foot-driven movement, floppy limbs and flying, shrinking body fragments on elimination.
 - Brush sizing, neon trails, airflow view, touch controls, and an interactive starter scene.
 - Automatic scene persistence, including wind and object state.
-- Native rendering capped at approximately 30 frames per second.
+- Fixed 60 Hz physics with native rendering capped at approximately 30 frames per second.
 - No browser, game engine, account or network connection required to play.
 
 The palette includes powder, water, fire, seeds, gunpowder, fans, ice,
@@ -28,7 +28,7 @@ saltwater and snow. Tools include Wind, Air, Drag, Bubble, Wheel, Player,
 Fighter, Box, Ball, Create, Wall and Erase.
 
 This remains an independent approximation of the original. Air uses 4-pixel
-tiles, box-to-box collision uses conservative bounding circles, and bubbles
+tiles and particles use grid collisions, box-to-box collision uses conservative bounding circles, and bubbles
 use a deforming film rather than sealed fluid volumes. Create currently
 reuses the clone material behavior. Original saves, online sharing, copy/paste
 and the original game's complete UI/interaction rules are not supported.
@@ -90,7 +90,7 @@ Air raises pressure; right-clicking with Air lowers it. On touch, use the
 Air + / Air − button beside Flow to switch between pressure and suction. Set R chooses a
 material payload for subsequently placed fireworks and balls, as well as the
 right mouse brush. Selecting Erase as the secondary resets payloads to powder.
-Fireworks launch when ignited; balls release their payload on impact. The
+Fireworks launch when ignited; balls release their payload on impact. Gunpowder, C4 and nitro throw existing grains outward; gas mostly ignites and adds pressure. Bomb instead pulls a small cloud inward before the affected grains decay. The
 Flow overlay shows velocity arrows, green positive pressure and blue negative
 pressure. The default demo includes a fan-driven gear and movable objects.
 
@@ -106,7 +106,8 @@ Default location: `~/.local/state/surface-powder/world.bin`. Setting
 `XDG_STATE_HOME` moves it to `$XDG_STATE_HOME/surface-powder/world.bin`.
 Version 1 saves load automatically; the first upgraded save creates a
 `world.bin.v1.bak` copy. Version 2 saves retain pressure, velocity, bodies and
-material payloads. Corrupt or incompatible saves are preserved and reported rather than
+material payloads. Version 3 adds character joints, death fragments and particle momentum.
+Both older versions load automatically and receive a versioned backup before upgrading. Corrupt or incompatible saves are preserved and reported rather than
 overwritten. To start fresh, move the save file aside.
 
 ## Development
@@ -119,7 +120,8 @@ cargo run --release --locked -- --benchmark
 ```
 
 On macOS, use the same `RUSTFLAGS` setting from the build command for commands
-that link the executable. Tests cover particle conservation, barriers, pressure transport, wheel torque,
+that link the executable. Tests cover articulated movement and fragmentation, particle momentum and conservation,
+barriers, wind transport, pressure waves, wheel torque,
 body collision, bubble popping, material payloads, chemistry, electricity,
 legacy-save migration, deterministic save/load continuation and touch input.
 
@@ -134,7 +136,8 @@ On Unix, SIGUSR1 captures `preview.ppm` alongside the saved world.
 
 ## Performance
 
-The simulation keeps compact two-byte cells, a coarse air grid, and a maximum
+The simulation keeps compact two-byte material cells plus eight bytes of particle momentum
+per cell, a coarse air grid, and a maximum
 of 128 moving objects. It does not add physics-engine dependencies. Use
 `--benchmark` to measure simulation plus pixel rendering on your hardware;
 that benchmark excludes SDL presentation and UI drawing. Large active scenes

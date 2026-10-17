@@ -305,14 +305,14 @@ pub struct Input {
     pub jump: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct Actor {
-    pub x: f32,
-    pub y: f32,
+#[path = "actors.rs"]
+mod actors;
+pub use actors::Actor;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Motion {
     pub vx: f32,
     pub vy: f32,
-    pub kind: Material,
-    pub health: u8,
 }
 
 pub struct World {
@@ -323,6 +323,7 @@ pub struct World {
     pub air: Air,
     pub bodies: Vec<Body>,
     pub brush_payload: Material,
+    pub(crate) motion: Vec<Motion>,
     visited: Vec<u32>,
     tick: u32,
     rng: u64,
@@ -339,6 +340,7 @@ impl World {
             air: Air::new(width, height),
             bodies: Vec::new(),
             brush_payload: Material::Sand,
+            motion: vec![Motion::default(); width * height],
             visited: vec![0; width * height],
             tick: 0,
             rng: 0x69d2_739b_b853_a451,
@@ -346,6 +348,7 @@ impl World {
     }
     pub fn clear(&mut self) {
         self.cells.fill(Cell::default());
+        self.motion.fill(Motion::default());
         self.actors.clear();
         self.air.clear();
         self.bodies.clear();
@@ -431,16 +434,16 @@ impl World {
         if let Ok(mut old) = std::fs::File::open(path) {
             use std::io::Read;
             let mut header = [0; 9];
-            if old.read_exact(&mut header).is_ok() && &header == b"SURFDUST\x01" {
+            if old.read_exact(&mut header).is_ok() && &header[..8] == b"SURFDUST" && header[8] < 3 {
                 let mut backup = path.as_os_str().to_os_string();
-                backup.push(".v1.bak");
+                backup.push(format!(".v{}.bak", header[8]));
                 if !std::path::Path::new(&backup).exists() {
                     std::fs::copy(path, backup)?;
                 }
             }
         }
-        let mut bytes = Vec::with_capacity(self.cells.len() * 2 + 64 + self.actors.len() * 18);
-        bytes.extend_from_slice(b"SURFDUST\x02");
+        let mut bytes = Vec::with_capacity(self.cells.len() * 10 + 64 + self.actors.len() * 200);
+        bytes.extend_from_slice(b"SURFDUST\x03");
         bytes.extend_from_slice(&(self.width as u32).to_le_bytes());
         bytes.extend_from_slice(&(self.height as u32).to_le_bytes());
         bytes.extend_from_slice(&self.tick.to_le_bytes());
@@ -454,6 +457,13 @@ impl World {
                 bytes.extend_from_slice(&v.to_le_bytes());
             }
             bytes.extend_from_slice(&[a.kind as u8, a.health]);
+            bytes.extend_from_slice(&[a.dead as u8, a.stride, a.jump_wait, a.knocked]);
+            bytes.extend_from_slice(&a.age.to_le_bytes());
+            for joint in &a.joints {
+                for v in [joint.x, joint.y, joint.old_x, joint.old_y] {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+            }
         }
         for node in &self.air.nodes {
             for v in [node.vx, node.vy, node.pressure] {
@@ -470,6 +480,10 @@ impl World {
             bytes.push(b.payload as u8);
         }
         bytes.push(self.brush_payload as u8);
+        for motion in &self.motion {
+            bytes.extend_from_slice(&motion.vx.to_le_bytes());
+            bytes.extend_from_slice(&motion.vy.to_le_bytes());
+        }
         let mut tmp = path.as_os_str().to_os_string();
         tmp.push(".tmp");
         let mut file = std::fs::File::create(&tmp)?;
@@ -487,7 +501,7 @@ impl World {
         }
         let mut bytes = Vec::new();
         std::fs::File::open(path)?
-            .take(6_000_001)
+            .take(24_000_001)
             .read_to_end(&mut bytes)?;
         let mut cursor = 0;
         fn take<'a>(bytes: &'a [u8], cursor: &mut usize, n: usize) -> std::io::Result<&'a [u8]> {
@@ -498,7 +512,7 @@ impl World {
             Ok(part)
         }
         let header = take(&bytes, &mut cursor, 9)?;
-        if &header[..8] != b"SURFDUST" || ![1, 2].contains(&header[8]) {
+        if &header[..8] != b"SURFDUST" || ![1, 2, 3].contains(&header[8]) {
             return Err(invalid());
         }
         let version = header[8];
@@ -555,16 +569,39 @@ impl World {
             {
                 return Err(invalid());
             }
-            world.actors.push(Actor {
-                x: values[0],
-                y: values[1],
-                vx: values[2],
-                vy: values[3],
-                kind,
-                health: b[1],
-            });
+            let mut actor = Actor::new(values[0], values[1], kind);
+            actor.impulse(values[2], values[3]);
+            actor.health = b[1];
+            if version >= 3 {
+                let state = take(&bytes, &mut cursor, 4)?;
+                if state[0] > 1 {
+                    return Err(invalid());
+                }
+                actor.dead = state[0] != 0;
+                actor.stride = state[1];
+                actor.jump_wait = state[2];
+                actor.knocked = state[3];
+                actor.age = u16::from_le_bytes(take(&bytes, &mut cursor, 2)?.try_into().unwrap());
+                for joint in &mut actor.joints {
+                    let mut v = [0.; 4];
+                    for value in &mut v {
+                        *value =
+                            f32::from_le_bytes(take(&bytes, &mut cursor, 4)?.try_into().unwrap());
+                        if !value.is_finite() || value.abs() > 4096. {
+                            return Err(invalid());
+                        }
+                    }
+                    *joint = actors::Joint {
+                        x: v[0],
+                        y: v[1],
+                        old_x: v[2],
+                        old_y: v[3],
+                    };
+                }
+            }
+            world.actors.push(actor);
         }
-        if version == 2 {
+        if version >= 2 {
             for node in &mut world.air.nodes {
                 let mut values = [0.; 3];
                 for v in &mut values {
@@ -614,6 +651,19 @@ impl World {
                 .filter(|m| m.is_cell())
                 .ok_or_else(invalid)?;
         }
+        if version >= 3 {
+            for motion in &mut world.motion {
+                motion.vx = f32::from_le_bytes(take(&bytes, &mut cursor, 4)?.try_into().unwrap());
+                motion.vy = f32::from_le_bytes(take(&bytes, &mut cursor, 4)?.try_into().unwrap());
+                if !motion.vx.is_finite()
+                    || !motion.vy.is_finite()
+                    || motion.vx.abs() > 32.
+                    || motion.vy.abs() > 32.
+                {
+                    return Err(invalid());
+                }
+            }
+        }
         if cursor != bytes.len() {
             return Err(invalid());
         }
@@ -640,6 +690,7 @@ impl World {
     fn set(&mut self, x: i32, y: i32, material: Material) {
         if let Some(i) = self.index(x, y) {
             self.cells[i] = Cell::new(material);
+            self.motion[i] = Motion::default();
             self.visited[i] = self.tick;
         }
     }
@@ -723,14 +774,7 @@ impl World {
                     .iter()
                     .any(|a| (a.x - x1 as f32).abs() < 6. && (a.y - y1 as f32).abs() < 12.)
             {
-                self.actors.push(Actor {
-                    x: x1 as f32,
-                    y: y1 as f32,
-                    vx: 0.,
-                    vy: 0.,
-                    kind: material,
-                    health: 255,
-                });
+                self.actors.push(Actor::new(x1 as f32, y1 as f32, material));
             }
             return;
         }
@@ -746,6 +790,7 @@ impl World {
                                 || self.cells[i].material == Material::Empty
                             {
                                 self.cells[i] = Cell::new(material);
+                                self.motion[i] = Motion::default();
                                 if material == Material::Firework {
                                     self.cells[i].life = self.brush_payload as u8 & 63;
                                 } else if matches!(material, Material::Fan | Material::Pump) {
@@ -814,6 +859,7 @@ impl World {
                     if self.cells[i].material.movable() && self.cells[j].material == Material::Empty
                     {
                         self.cells.swap(i, j);
+                        self.motion.swap(i, j);
                     }
                 }
             }
@@ -839,6 +885,7 @@ impl World {
         };
         if allowed {
             self.cells.swap(i, j);
+            self.motion.swap(i, j);
             self.visited[i] = self.tick;
             self.visited[j] = self.tick;
             true
@@ -869,7 +916,7 @@ impl World {
                     | Material::C4
                     | Material::Bomb
             ) {
-                self.explode(x, y, if m == Material::Gas { 5 } else { 7 });
+                self.explode(x, y, 10);
             } else {
                 self.set(x, y, Material::Fire);
             }
@@ -880,18 +927,184 @@ impl World {
         }
     }
     fn explode(&mut self, x: i32, y: i32, r: i32) {
-        self.air.add_pressure(x as f32, y as f32, 6., r as f32 * 2.);
+        let radius = r as f32;
+        let source = self.at(x, y);
+        if source == Material::Bomb {
+            self.bomb_collapse(x, y);
+            return;
+        }
+        self.air.add_pressure(
+            x as f32,
+            y as f32,
+            if source == Material::Gas {
+                2.
+            } else if source == Material::C4 {
+                1.
+            } else {
+                10.
+            },
+            radius,
+        );
+        // A blast pushes existing particles; it must not erase a disk of sand/water.
+        // Rays stop at permanent barriers, protecting material on their far side.
         for dy in -r..=r {
             for dx in -r..=r {
-                if dx * dx + dy * dy > r * r {
+                let distance = (dx as f32).hypot(dy as f32);
+                if distance > radius || !self.blast_visible(x, y, x + dx, y + dy) {
                     continue;
                 }
-                let m = self.at(x + dx, y + dy);
-                if !matches!(m, Material::Wall | Material::Metal | Material::Clone) {
-                    self.set(x + dx, y + dy, Material::Fire);
+                let Some(i) = self.index(x + dx, y + dy) else {
+                    continue;
+                };
+                let m = self.cells[i].material;
+                let force = (1. - distance / (radius + 1.)) * 9.;
+                if m == Material::Glass {
+                    self.set(x + dx, y + dy, Material::Sand);
+                } else if m == Material::Gas && source == Material::Gas {
+                    if self.random() % 100 == 0 {
+                        self.set(x + dx, y + dy, Material::Fire);
+                    }
+                } else if m == Material::C4 && dx.abs() <= 1 && dy.abs() <= 1 {
+                    self.cells[i].life = 1;
+                }
+                if source != Material::Gas
+                    && self.cells[i].material.movable()
+                    && self.cells[i].material != Material::Empty
+                {
+                    let norm = distance.max(1.);
+                    self.motion[i].vx =
+                        (self.motion[i].vx + dx as f32 / norm * force).clamp(-24., 24.);
+                    self.motion[i].vy =
+                        (self.motion[i].vy + dy as f32 / norm * force).clamp(-24., 24.);
                 }
             }
         }
+        self.set(
+            x,
+            y,
+            if source == Material::C4 {
+                Material::Empty
+            } else {
+                Material::Fire
+            },
+        );
+        for body in &mut self.bodies {
+            let dx = body.x - x as f32;
+            let dy = body.y - y as f32;
+            let d = dx.hypot(dy).max(1.);
+            if d < radius * 2. && body.kind != BodyKind::Wheel {
+                let force = (1. - d / (radius * 2.)) * 7.;
+                body.vx += dx / d * force;
+                body.vy += dy / d * force;
+                body.angular_velocity += dx.signum() * force * 0.02;
+            }
+        }
+        for actor in &mut self.actors {
+            let dx = actor.x - x as f32;
+            let dy = actor.y - y as f32;
+            let d = dx.hypot(dy).max(1.);
+            if d < radius * 2. {
+                let force = (1. - d / (radius * 2.)) * 8.;
+                actor.impulse(dx / d * force, dy / d * force);
+                actor.health = actor.health.saturating_sub((force * 24.) as u8);
+            }
+        }
+    }
+    fn bomb_collapse(&mut self, x: i32, y: i32) {
+        // Original BOMB grabs a small cloud inward before its tagged grains decay.
+        for dy in -4_i32..=4 {
+            for dx in -4_i32..=4 {
+                if dx * dx + dy * dy > 16 || !self.blast_visible(x, y, x + dx, y + dy) {
+                    continue;
+                }
+                let Some(i) = self.index(x + dx, y + dy) else {
+                    continue;
+                };
+                let m = self.cells[i].material;
+                if !m.movable() || matches!(m, Material::Empty | Material::Bomb) {
+                    continue;
+                }
+                self.set(x + dx, y + dy, Material::Bomb);
+                self.cells[i].life = 128 | m as u8;
+                self.motion[i] = Motion {
+                    vx: -dx as f32,
+                    vy: -dy as f32,
+                };
+            }
+        }
+        self.set(x, y, Material::Empty);
+    }
+    fn blast_visible(&self, x: i32, y: i32, tx: i32, ty: i32) -> bool {
+        let steps = (tx - x).abs().max((ty - y).abs());
+        (1..=steps).all(|n| {
+            !matches!(
+                self.at(x + (tx - x) * n / steps, y + (ty - y) * n / steps),
+                Material::Wall | Material::Metal | Material::Clone
+            )
+        })
+    }
+    fn transport_particle(
+        &mut self,
+        mut i: usize,
+        mut x: i32,
+        mut y: i32,
+        m: Material,
+    ) -> (usize, i32, i32) {
+        if !m.movable() || (m == Material::Spark && self.cells[i].life & 128 != 0) {
+            self.motion[i] = Motion::default();
+            return (i, x, y);
+        }
+        let (ax, ay, _) = self.air.sample(x as f32, y as f32);
+        let coupling = if m.density() <= 1 {
+            0.20
+        } else if m == Material::Mercury || m == Material::Stone {
+            0.015
+        } else {
+            0.075
+        };
+        let v = &mut self.motion[i];
+        v.vx = (v.vx * 0.96 + (ax - v.vx) * coupling).clamp(-24., 24.);
+        v.vy = (v.vy * 0.96 + (ay - v.vy) * coupling).clamp(-24., 24.);
+        let travel = v.vx.hypot(v.vy).max(3.8) / 3.8;
+        let vx = v.vx / travel;
+        let vy = v.vy / travel;
+        let distance = vx.abs().max(vy.abs());
+        let steps = distance.ceil() as i32;
+        if steps == 0 {
+            return (i, x, y);
+        }
+        let start_x = x;
+        let start_y = y;
+        // Randomized fractional displacement preserves subpixel flow without allocating positions.
+        let fraction = (self.random() & 65535) as f32 / 65536.;
+        for n in 1..=steps {
+            let tx = start_x + (vx * n as f32 / steps as f32 + fraction).floor() as i32;
+            let ty = start_y + (vy * n as f32 / steps as f32 + fraction).floor() as i32;
+            if tx == x && ty == y {
+                continue;
+            }
+            let Some(j) = self.index(tx, ty) else {
+                self.motion[i] = Motion::default();
+                break;
+            };
+            if self.cells[j].material != Material::Empty
+                || (tx != x
+                    && ty != y
+                    && (self.at(tx, y) != Material::Empty || self.at(x, ty) != Material::Empty))
+            {
+                self.motion[i].vx *= 0.15;
+                self.motion[i].vy *= 0.15;
+                break;
+            }
+            self.cells.swap(i, j);
+            self.motion.swap(i, j);
+            self.visited[i] = self.tick;
+            self.visited[j] = self.tick;
+            i = j;
+            x = tx;
+            y = ty;
+        }
+        (i, x, y)
     }
     pub fn step(&mut self, input: Input) {
         self.tick = self.tick.wrapping_add(1);
@@ -913,30 +1126,8 @@ impl World {
                     continue;
                 }
                 let dir = if self.random() & 1 == 0 { -1 } else { 1 };
+                let (i, x, y) = self.transport_particle(i, x, y, m);
                 let neighbors = [(x, y - 1), (x + dir, y), (x - dir, y), (x, y + 1)];
-                if m.movable()
-                    && !matches!(m, Material::Stone | Material::Mercury)
-                    && !(m == Material::Spark && self.cells[i].life & 128 != 0)
-                {
-                    let (vx, vy, _) = self.air.sample(x as f32, y as f32);
-                    let light = if m.density() <= 1 { 1. } else { 0.35 };
-                    if (vx.abs() + vy.abs()) * light > 0.6 && self.random() % 4 == 0 {
-                        let nx = x + (vx * light).clamp(-1., 1.).round() as i32;
-                        let ny = y + (vy * light).clamp(-1., 1.).round() as i32;
-                        if let Some(j) = self.index(nx, ny) {
-                            if self.cells[j].material == Material::Empty
-                                && (nx == x
-                                    || ny == y
-                                    || (self.at(nx, y) == Material::Empty
-                                        && self.at(x, ny) == Material::Empty))
-                            {
-                                self.cells.swap(i, j);
-                                self.visited[j] = self.tick;
-                                continue;
-                            }
-                        }
-                    }
-                }
                 if self.step_new_material(i, x, y, m, dir, &neighbors) {
                     continue;
                 }
@@ -1197,8 +1388,8 @@ impl World {
                 }
             }
             C4 => {
-                if hot {
-                    self.explode(x, y, 12);
+                if hot || self.cells[i].life != 0 {
+                    self.explode(x, y, 10);
                 }
             }
             Fuse => {
@@ -1290,6 +1481,7 @@ impl World {
                         let from = self.index(x - dx, y - dy).unwrap();
                         let to = self.index(tx, ty).unwrap();
                         self.cells[to] = self.cells[from];
+                        self.motion[to] = self.motion[from];
                         self.visited[to] = self.tick;
                         self.set(x - dx, y - dy, Empty);
                     }
@@ -1426,6 +1618,12 @@ impl World {
                             let py = y + (a.sin() * 7.).round() as i32;
                             if self.at(px, py) == Empty {
                                 self.set(px, py, payload);
+                                if let Some(j) = self.index(px, py) {
+                                    self.motion[j] = Motion {
+                                        vx: a.cos() * 5.,
+                                        vy: a.sin() * 5.,
+                                    };
+                                }
                             }
                         }
                     }
@@ -1452,8 +1650,18 @@ impl World {
                 }
             }
             Bomb => {
-                if hot || ns.iter().any(|&(a, b)| self.at(a, b) == Sand) {
-                    self.explode(x, y, 14);
+                if self.cells[i].life & 128 != 0 {
+                    if self.random() % 20 == 0 {
+                        let original = Material::from_u8(self.cells[i].life & 127).unwrap_or(Empty);
+                        let restored = match original {
+                            Gunpowder | Nitro | Gas | Oil | Seed | Wood => Fire,
+                            Water | Ice | Snow => Steam,
+                            other => other,
+                        };
+                        self.set(x, y, restored);
+                    }
+                } else if hot || ns.iter().any(|&(a, b)| self.at(a, b) == Sand) {
+                    self.bomb_collapse(x, y);
                 } else {
                     self.exchange(i, x, y + 1, false);
                 }
@@ -1461,7 +1669,7 @@ impl World {
             Nitro => {
                 let (_, _, pressure) = self.air.sample(x as f32, y as f32);
                 if hot || pressure.abs() > 2. {
-                    self.explode(x, y, 12);
+                    self.explode(x, y, 10);
                 } else {
                     self.fall_liquid(i, x, y, dir);
                 }
@@ -1533,97 +1741,16 @@ impl World {
         }
         self.exchange(i, x + dir, y, false);
     }
-    fn actor_blocked(&self, x: f32, y: f32) -> bool {
-        matches!(
-            self.at(x as i32, y as i32),
-            Material::Wall
-                | Material::Wood
-                | Material::Metal
-                | Material::Clone
-                | Material::Ice
-                | Material::Stone
-                | Material::Glass
-                | Material::Fan
-                | Material::Pump
-                | Material::C4
-        )
-    }
     fn step_actors(&mut self, input: Input) {
-        for n in 0..self.actors.len() {
-            let mut a = self.actors[n];
-            let grounded =
-                self.actor_blocked(a.x - 2., a.y + 8.) || self.actor_blocked(a.x + 2., a.y + 8.);
-            let (direction, jump) = if a.kind == Material::Player {
-                ((input.right as i8 - input.left as i8) as f32, input.jump)
-            } else {
-                let target = self
-                    .actors
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != n)
-                    .min_by(|(_, b), (_, c)| (b.x - a.x).abs().total_cmp(&(c.x - a.x).abs()))
-                    .map(|(_, b)| b.x);
-                let direction = target
-                    .map(|x| if x < a.x { -1. } else { 1. })
-                    .unwrap_or(if n % 2 == 0 { 1. } else { -1. });
-                (
-                    direction,
-                    self.actor_blocked(a.x + direction * 4., a.y + 3.) || self.random() % 150 == 0,
-                )
-            };
-            a.vx = (a.vx * 0.65 + direction * 0.5).clamp(-1.7, 1.7);
-            if grounded {
-                a.vy = 0.;
-                if jump {
-                    a.vy = -3.6;
-                }
-            }
-            let (wind_x, wind_y, _) = self.air.sample(a.x, a.y);
-            a.vx = (a.vx + wind_x * 0.06).clamp(-4., 4.);
-            a.vy = (a.vy + 0.19 + wind_y * 0.03).clamp(-5., 3.);
-            // Sweep in subpixel steps so a thin drawn platform catches falling actors.
-            let horizontal = a.vx.abs().ceil().max(1.) as usize;
-            for _ in 0..horizontal {
-                let nx = (a.x + a.vx / horizontal as f32).clamp(3., self.width as f32 - 4.);
-                if !self.actor_blocked(nx, a.y) && !self.actor_blocked(nx, a.y + 6.) {
-                    a.x = nx;
-                } else {
-                    a.vx = 0.;
-                    break;
-                }
-            }
-            let vertical = a.vy.abs().ceil().max(1.) as usize;
-            for _ in 0..vertical {
-                let ny = (a.y + a.vy / vertical as f32).clamp(5., self.height as f32 - 9.);
-                if !self.actor_blocked(a.x, ny + 7.) && !self.actor_blocked(a.x, ny - 5.) {
-                    a.y = ny;
-                } else {
-                    a.vy = 0.;
-                    break;
-                }
-            }
-            for (dx, dy) in [(0, 0), (0, 5), (-2, 7), (2, 7)] {
-                if matches!(
-                    self.at(a.x as i32 + dx, a.y as i32 + dy),
-                    Material::Fire | Material::Magma | Material::Acid | Material::Spark
-                ) {
-                    a.health = a.health.saturating_sub(5);
-                }
-            }
-            if a.kind == Material::Fighter {
-                for j in 0..self.actors.len() {
-                    if j != n
-                        && (self.actors[j].x - a.x).abs() < 8.
-                        && (self.actors[j].y - a.y).abs() < 10.
-                    {
-                        self.actors[j].vx = if self.actors[j].x < a.x { -3. } else { 3. };
-                        self.actors[j].vy = -1.8;
-                    }
-                }
-            }
-            self.actors[n] = a;
-        }
-        self.actors.retain(|a| a.health > 0);
+        actors::step(
+            &mut self.actors,
+            &self.cells,
+            self.width,
+            self.height,
+            &self.air,
+            input,
+            self.tick,
+        );
     }
     pub fn render(&self, pixels: &mut [u32]) {
         assert_eq!(pixels.len(), self.cells.len());
@@ -1640,41 +1767,69 @@ impl World {
             };
         }
         render_bodies(&self.bodies, pixels, self.width, self.height);
-        for actor in &self.actors {
-            let x = actor.x as i32;
-            let y = actor.y as i32;
-            let c = actor.kind.color();
-            let stride = if actor.vx.abs() > 0.15 {
-                ((self.tick / 5) % 2) as i32 * 2 - 1
-            } else {
-                0
-            };
-            let mut line = |x0: i32, y0: i32, x1: i32, y1: i32| {
-                let steps = (x1 - x0).abs().max((y1 - y0).abs()).max(1);
-                for n in 0..=steps {
-                    if let Some(i) =
-                        self.index(x0 + (x1 - x0) * n / steps, y0 + (y1 - y0) * n / steps)
-                    {
-                        pixels[i] = c;
-                    }
-                }
-            };
-            line(x - 2, y - 5, x + 2, y - 5);
-            line(x - 2, y - 5, x - 2, y - 2);
-            line(x + 2, y - 5, x + 2, y - 2);
-            line(x - 2, y - 2, x + 2, y - 2);
-            line(x, y - 1, x, y + 3);
-            line(x, y, x - 4, y + 3);
-            line(x, y, x + 4, y + 3);
-            line(x, y + 3, x - 3 - stride, y + 7);
-            line(x, y + 3, x + 3 + stride, y + 7);
-        }
+        actors::render(&self.actors, pixels, self.width, self.height);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn blast_preserves_powder_and_gives_outward_momentum() {
+        let mut w = World::new(64, 64);
+        w.set(37, 32, Material::Sand);
+        w.set(27, 32, Material::Water);
+        w.explode(32, 32, 12);
+        assert_eq!(w.at(37, 32), Material::Sand);
+        assert_eq!(w.at(27, 32), Material::Water);
+        assert!(w.motion[32 * 64 + 37].vx > 3.);
+        assert!(w.motion[32 * 64 + 27].vx < -3.);
+        for _ in 0..4 {
+            w.step(Input::default());
+        }
+        assert!(w
+            .cells
+            .iter()
+            .enumerate()
+            .any(|(i, c)| c.material == Material::Sand && i % 64 > 40));
+    }
+    #[test]
+    fn blast_cannot_kick_particles_through_a_wall() {
+        let mut w = World::new(64, 64);
+        w.paint_line(34, 0, 34, 63, 0, Material::Wall);
+        w.set(37, 32, Material::Sand);
+        w.explode(32, 32, 12);
+        assert_eq!(w.motion[32 * 64 + 37], Motion::default());
+        w.motion[32 * 64 + 37] = Motion { vx: -20., vy: 0. };
+        w.step(Input::default());
+        assert!(!w
+            .cells
+            .iter()
+            .enumerate()
+            .any(|(i, c)| c.material == Material::Sand && i % 64 < 34));
+    }
+    #[test]
+    fn v2_saves_upgrade_and_v3_retains_particle_inertia() {
+        let mut w = World::new(16, 16);
+        let path =
+            std::env::temp_dir().join(format!("surface-momentum-{}.sav", std::process::id()));
+        w.set(8, 8, Material::Sand);
+        w.motion[8 * 16 + 8] = Motion { vx: 3.5, vy: -2. };
+        w.save(&path).unwrap();
+        let loaded = World::load(&path).unwrap();
+        assert_eq!(loaded.motion, w.motion);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[8] = 2;
+        bytes.truncate(bytes.len() - w.cells.len() * 8);
+        std::fs::write(&path, &bytes).unwrap();
+        let legacy = World::load(&path).unwrap();
+        assert!(legacy.motion.iter().all(|m| *m == Motion::default()));
+        legacy.save(&path).unwrap();
+        let backup = format!("{}.v2.bak", path.display());
+        assert_eq!(std::fs::read(&backup).unwrap(), bytes);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(backup).unwrap();
+    }
     #[test]
     fn compact_cells() {
         assert_eq!(std::mem::size_of::<Cell>(), 2);
@@ -1731,18 +1886,20 @@ mod tests {
         let mut w = World::new(64, 64);
         w.paint_line(0, 50, 63, 50, 0, Material::Wall);
         w.paint_line(20, 42, 20, 42, 0, Material::Player);
-        for _ in 0..5 {
+        for _ in 0..30 {
             w.step(Input {
                 right: true,
                 ..Input::default()
             });
         }
-        assert!(w.actors[0].x > 22.);
+        assert!(w.actors[0].x > 22., "{:?}", w.actors[0]);
         let y = w.actors[0].y;
-        w.step(Input {
-            jump: true,
-            ..Input::default()
-        });
+        for _ in 0..10 {
+            w.step(Input {
+                jump: true,
+                ..Input::default()
+            });
+        }
         assert!(w.actors[0].y < y);
     }
     #[test]
@@ -1766,7 +1923,10 @@ mod tests {
         for _ in 0..40 {
             w.step(Input::default());
         }
-        assert!(w.actors[0].y < 43. && w.actors[0].y > 41.);
+        assert!(w.actors[0].joints[4..6]
+            .iter()
+            .all(|j| j.y < 50. && j.y > 47.));
+        assert!(w.actors[0].y < 48.);
     }
     #[test]
     fn conductive_spark_preserves_the_metal_cell() {
@@ -1895,7 +2055,9 @@ mod tests {
         w.set(20, 20, Material::Bomb);
         w.set(21, 20, Material::Sand);
         react(&mut w, 20, 20);
-        assert_eq!(w.at(20, 20), Material::Fire);
+        assert_eq!(w.at(20, 20), Material::Empty);
+        assert_eq!(w.at(21, 20), Material::Bomb);
+        assert!(w.motion[20 * 64 + 21].vx < 0.);
         w.set(45, 45, Material::Glass);
         w.apply_pressure(45, 45, 8, 10.);
         react(&mut w, 45, 45);

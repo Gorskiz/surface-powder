@@ -719,15 +719,25 @@ fn main() -> Result<(), String> {
                 || keyboard.is_scancode_pressed(Scancode::W)
                 || app.held.values().any(|a| *a == Action::Jump),
         };
-        if frame.duration_since(last_step) >= Duration::from_millis(32) {
-            if !app.paused {
+        let step_time = Duration::from_nanos(16_666_667);
+        if app.paused {
+            last_step = frame;
+        } else {
+            // Fixed simulation clock matches the original's 60 Hz independently of presentation.
+            // Bound catch-up so a stalled renderer cannot queue unbounded physics work.
+            let mut steps = 0;
+            while frame.duration_since(last_step) >= step_time && steps < 4 {
                 let strokes: Vec<_> = app.pointers.values().copied().collect();
                 for stroke in strokes {
                     app.pour(stroke);
                 }
                 app.world.step(input);
+                last_step += step_time;
+                steps += 1;
             }
-            last_step = frame;
+            if steps == 4 {
+                last_step = frame;
+            }
         }
         app.world.render(&mut pixels);
         for (p, t) in pixels.iter_mut().zip(&mut trails) {

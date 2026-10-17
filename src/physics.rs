@@ -16,6 +16,9 @@ pub struct Air {
     pub nodes: Vec<AirCell>,
     scratch: Vec<AirCell>,
     blocked: Vec<bool>,
+    // Four parallel pixel lanes per coarse face: thin walls seal, isolated dots do not.
+    right_open: Vec<u8>,
+    down_open: Vec<u8>,
 }
 impl Air {
     pub fn new(width: usize, height: usize) -> Self {
@@ -29,6 +32,8 @@ impl Air {
             nodes: vec![AirCell::default(); cols * rows],
             scratch: vec![AirCell::default(); cols * rows],
             blocked: vec![false; cols * rows],
+            right_open: vec![0; cols * rows],
+            down_open: vec![0; cols * rows],
         }
     }
     pub fn clear(&mut self) {
@@ -68,10 +73,102 @@ impl Air {
         if self.nodes.is_empty() || !x.is_finite() || !y.is_finite() {
             return (0., 0., 0.);
         }
-        let cx = ((x.max(0.) / self.cell_size as f32) as usize).min(self.cols - 1);
-        let cy = ((y.max(0.) / self.cell_size as f32) as usize).min(self.rows - 1);
-        let n = self.nodes[cy * self.cols + cx];
-        (n.vx, n.vy, n.pressure)
+        // Values live at cell centers, rather than at the top-left pixel of each tile.
+        let gx = (x / self.cell_size as f32 - 0.5).clamp(0., (self.cols - 1) as f32);
+        let gy = (y / self.cell_size as f32 - 0.5).clamp(0., (self.rows - 1) as f32);
+        let x0 = gx.floor() as usize;
+        let y0 = gy.floor() as usize;
+        let x1 = (x0 + 1).min(self.cols - 1);
+        let y1 = (y0 + 1).min(self.rows - 1);
+        let tx = gx - x0 as f32;
+        let ty = gy - y0 as f32;
+        let mut result = AirCell::default();
+        for (cx, cy, weight) in [
+            (x0, y0, (1. - tx) * (1. - ty)),
+            (x1, y0, tx * (1. - ty)),
+            (x0, y1, (1. - tx) * ty),
+            (x1, y1, tx * ty),
+        ] {
+            let n = self.nodes[cy * self.cols + cx];
+            result.vx += n.vx * weight;
+            result.vy += n.vy * weight;
+            result.pressure += n.pressure * weight;
+        }
+        (result.vx, result.vy, result.pressure)
+    }
+    fn rebuild_obstacles(&mut self, width: usize, height: usize, cells: &[Cell]) {
+        let s = self.cell_size;
+        for y in 0..self.rows {
+            for x in 0..self.cols {
+                let i = y * self.cols + x;
+                let mut occupied = 0;
+                let mut total = 0;
+                for py in y * s..((y + 1) * s).min(height) {
+                    for px in x * s..((x + 1) * s).min(width) {
+                        total += 1;
+                        occupied += usize::from(solid(cells[py * width + px].material));
+                    }
+                }
+                self.blocked[i] = occupied * 4 >= total * 3;
+                let mut right = 0;
+                let mut down = 0;
+                // A lane crosses between adjacent coarse centers. Checking its entire
+                // length catches a one-pixel wall wherever it falls inside a tile.
+                if x + 1 < self.cols {
+                    for py in y * s..((y + 1) * s).min(height) {
+                        if (x * s + s / 2..((x + 1) * s + s / 2 + 1).min(width))
+                            .all(|px| !solid(cells[py * width + px].material))
+                        {
+                            right += 1;
+                        }
+                    }
+                }
+                if y + 1 < self.rows {
+                    for px in x * s..((x + 1) * s).min(width) {
+                        if (y * s + s / 2..((y + 1) * s + s / 2 + 1).min(height))
+                            .all(|py| !solid(cells[py * width + px].material))
+                        {
+                            down += 1;
+                        }
+                    }
+                }
+                self.right_open[i] = right;
+                self.down_open[i] = down;
+            }
+        }
+    }
+    fn face(&self, x: usize, y: usize, dx: isize, dy: isize) -> f32 {
+        if (dx < 0 && x == 0)
+            || (dx > 0 && x + 1 == self.cols)
+            || (dy < 0 && y == 0)
+            || (dy > 0 && y + 1 == self.rows)
+        {
+            return 0.;
+        }
+        let i = y * self.cols + x;
+        let j = (y as isize + dy) as usize * self.cols + (x as isize + dx) as usize;
+        if self.blocked[i] || self.blocked[j] {
+            return 0.;
+        }
+        let lanes = match (dx, dy) {
+            (-1, 0) => self.right_open[i - 1],
+            (1, 0) => self.right_open[i],
+            (0, -1) => self.down_open[i - self.cols],
+            (0, 1) => self.down_open[i],
+            _ => 0,
+        };
+        lanes as f32 / self.cell_size as f32
+    }
+    fn diagonal_face(&self, x: usize, y: usize, dx: isize, dy: isize) -> f32 {
+        let horizontal = self.face(x, y, dx, 0);
+        let vertical = self.face(x, y, 0, dy);
+        if horizontal == 0. || vertical == 0. {
+            return 0.;
+        }
+        horizontal
+            .min(vertical)
+            .min(self.face((x as isize + dx) as usize, y, 0, dy))
+            .min(self.face(x, (y as isize + dy) as usize, dx, 0))
     }
     pub fn step(&mut self, width: usize, height: usize, cells: &[Cell]) {
         if cells.len() != width * height
@@ -80,15 +177,10 @@ impl Air {
         {
             return;
         }
-        self.blocked.fill(false);
-        // One solid pixel seals its coarse tile, so even a thin drawn wall is airtight.
-        for (i, c) in cells.iter().enumerate() {
-            if solid(c.material) {
-                self.blocked
-                    [(i / width / self.cell_size) * self.cols + (i % width / self.cell_size)] =
-                    true;
-            }
-        }
+        self.rebuild_obstacles(width, height, cells);
+        self.scratch.copy_from_slice(&self.nodes);
+        // Carry momentum forward before solving pressure. Diffusion alone makes a
+        // wind stroke fade in place; transport makes a jet travel across the scene.
         for y in 0..self.rows {
             for x in 0..self.cols {
                 let i = y * self.cols + x;
@@ -97,52 +189,79 @@ impl Air {
                     continue;
                 }
                 let c = self.nodes[i];
-                let neighbor = |nx: isize, ny: isize| {
-                    if nx < 0 || ny < 0 || nx >= self.cols as isize || ny >= self.rows as isize {
-                        return AirCell {
-                            pressure: c.pressure,
-                            ..AirCell::default()
-                        };
-                    }
-                    let j = ny as usize * self.cols + nx as usize;
-                    if self.blocked[j] {
-                        AirCell {
-                            pressure: c.pressure,
-                            ..AirCell::default()
-                        }
+                let total = c.vx.abs() + c.vy.abs();
+                if total < 0.00001 {
+                    continue;
+                }
+                let sx = if c.vx < 0. { -1 } else { 1 };
+                let sy = if c.vy < 0. { -1 } else { 1 };
+                let (major_x, major_y, major, minor) = if c.vx.abs() >= c.vy.abs() {
+                    (sx, 0, c.vx.abs(), c.vy.abs())
+                } else {
+                    (0, sy, c.vy.abs(), c.vx.abs())
+                };
+                for (dx, dy, speed) in [(major_x, major_y, major), (sx, sy, minor)] {
+                    let fraction = 0.48 * speed / total;
+                    let opening = if dx != 0 && dy != 0 {
+                        self.diagonal_face(x, y, dx, dy)
                     } else {
-                        self.nodes[j]
+                        self.face(x, y, dx, dy)
+                    };
+                    let moved = fraction * opening;
+                    // Momentum hitting a wall is absorbed; parallel flow survives.
+                    self.scratch[i].vx -= c.vx * fraction;
+                    self.scratch[i].vy -= c.vy * fraction;
+                    if opening > 0. {
+                        let j = (y as isize + dy) as usize * self.cols + (x as isize + dx) as usize;
+                        self.scratch[j].vx += c.vx * moved;
+                        self.scratch[j].vy += c.vy * moved;
+                        let displacement = total * moved * 0.35;
+                        self.scratch[i].pressure -= displacement;
+                        self.scratch[j].pressure += displacement;
                     }
-                };
-                let l = neighbor(x as isize - 1, y as isize);
-                let r = neighbor(x as isize + 1, y as isize);
-                let u = neighbor(x as isize, y as isize - 1);
-                let d = neighbor(x as isize, y as isize + 1);
-                let mut vx = (c.vx * 0.78 + (l.vx + r.vx + u.vx + d.vx) * 0.05
-                    - (r.pressure - l.pressure) * 0.19)
-                    * 0.993;
-                let mut vy = (c.vy * 0.78 + (l.vy + r.vy + u.vy + d.vy) * 0.05
-                    - (d.pressure - u.pressure) * 0.19)
-                    * 0.993;
-                if x == 0 || x + 1 == self.cols || self.blocked[i - 1] || self.blocked[i + 1] {
-                    vx *= 0.25;
                 }
-                if y == 0
-                    || y + 1 == self.rows
-                    || self.blocked[i - self.cols]
-                    || self.blocked[i + self.cols]
-                {
-                    vy *= 0.25;
+            }
+        }
+        std::mem::swap(&mut self.nodes, &mut self.scratch);
+        self.scratch.copy_from_slice(&self.nodes);
+        for y in 0..self.rows {
+            for x in 0..self.cols {
+                let i = y * self.cols + x;
+                if self.blocked[i] {
+                    continue;
                 }
-                let pressure = (c.pressure * 0.8
-                    + (l.pressure + r.pressure + u.pressure + d.pressure) * 0.05
-                    - (r.vx - l.vx + d.vy - u.vy) * 0.16)
-                    * 0.994;
-                self.scratch[i] = AirCell {
-                    vx: vx.clamp(-12., 12.),
-                    vy: vy.clamp(-12., 12.),
-                    pressure: pressure.clamp(-20., 20.),
-                };
+                let c = self.nodes[i];
+                for (dx, dy) in [
+                    (-1, 0),
+                    (1, 0),
+                    (0, -1),
+                    (0, 1),
+                    (-1, -1),
+                    (1, -1),
+                    (-1, 1),
+                    (1, 1),
+                ] {
+                    let diagonal = dx != 0 && dy != 0;
+                    let opening = if diagonal {
+                        self.diagonal_face(x, y, dx, dy)
+                    } else {
+                        self.face(x, y, dx, dy)
+                    };
+                    if opening == 0. {
+                        continue;
+                    }
+                    let j = (y as isize + dy) as usize * self.cols + (x as isize + dx) as usize;
+                    let gradient = (c.pressure - self.nodes[j].pressure) * opening;
+                    let coupling = if diagonal { 0.045 } else { 0.065 };
+                    self.scratch[i].vx += dx as f32 * gradient * coupling;
+                    self.scratch[i].vy += dy as f32 * gradient * coupling;
+                    self.scratch[i].pressure -= gradient * coupling;
+                }
+                // Tiny damping removes numerical leftovers without killing a jet
+                // before it can reach the other side of the playfield.
+                self.scratch[i].vx = (self.scratch[i].vx * 0.999).clamp(-12., 12.);
+                self.scratch[i].vy = (self.scratch[i].vy * 0.999).clamp(-12., 12.);
+                self.scratch[i].pressure = (self.scratch[i].pressure * 0.999).clamp(-20., 20.);
             }
         }
         std::mem::swap(&mut self.nodes, &mut self.scratch);
@@ -669,6 +788,84 @@ mod tests {
         }
         assert!(a.sample(38., 30.).0 > 0.);
         assert!(a.sample(30., 30.).0 < initial);
+    }
+    #[test]
+    fn sampling_interpolates_between_coarse_centers() {
+        let mut air = Air::new(16, 16);
+        air.nodes[0].vx = 2.;
+        air.nodes[1].vx = 10.;
+        assert_eq!(air.sample(2., 2.).0, 2.);
+        assert_eq!(air.sample(4., 2.).0, 6.);
+        assert_eq!(air.sample(6., 2.).0, 10.);
+    }
+    #[test]
+    fn isolated_solid_pixel_does_not_seal_a_tile() {
+        let mut cells = vec![Cell::default(); 64 * 64];
+        cells[30 * 64 + 32] = Cell::new(Material::Wall);
+        let mut air = Air::new(64, 64);
+        air.add_wind(24., 30., 5., 0., 8.);
+        for _ in 0..12 {
+            air.step(64, 64, &cells);
+        }
+        assert!(!air.blocked[7 * air.cols + 8]);
+        assert!(air.sample(42., 30.).0 > 0.02);
+    }
+    #[test]
+    fn jet_transports_momentum_downstream() {
+        let cells = vec![Cell::default(); 128 * 96];
+        let mut air = Air::new(128, 96);
+        air.add_wind(34., 46., 6., 0., 7.);
+        let centroid = |a: &Air| {
+            let mut sum = 0.;
+            let mut weight = 0.;
+            for (i, n) in a.nodes.iter().enumerate() {
+                let m = n.vx.max(0.);
+                sum += (i % a.cols) as f32 * m;
+                weight += m;
+            }
+            sum / weight * a.cell_size as f32
+        };
+        let start = centroid(&air);
+        for _ in 0..10 {
+            air.step(128, 96, &cells);
+        }
+        assert!(centroid(&air) > start + 8.);
+    }
+    #[test]
+    fn pressure_pulse_pushes_outward_in_both_axes() {
+        let cells = vec![Cell::default(); 96 * 96];
+        let mut air = Air::new(96, 96);
+        air.add_pressure(46., 46., 16., 8.);
+        for _ in 0..6 {
+            air.step(96, 96, &cells);
+        }
+        assert!(air.sample(34., 46.).0 < -0.01);
+        assert!(air.sample(58., 46.).0 > 0.01);
+        assert!(air.sample(46., 34.).1 < -0.01);
+        assert!(air.sample(46., 58.).1 > 0.01);
+    }
+    #[test]
+    fn continuous_thin_walls_seal_at_every_coarse_alignment() {
+        for wall_x in 28..32 {
+            let mut cells = vec![Cell::default(); 64 * 64];
+            for y in 0..64 {
+                cells[y * 64 + wall_x] = Cell::new(Material::Wall);
+            }
+            let mut air = Air::new(64, 64);
+            air.add_wind(14., 30., 8., 0., 8.);
+            air.add_pressure(14., 30., 15., 8.);
+            for _ in 0..40 {
+                air.step(64, 64, &cells);
+            }
+            assert!(
+                air.nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| i % air.cols >= 9)
+                    .all(|(_, n)| *n == AirCell::default()),
+                "wall at {wall_x} leaked"
+            );
+        }
     }
     #[test]
     fn wind_rotates_wheel_and_box_falls_onto_thin_floor() {
