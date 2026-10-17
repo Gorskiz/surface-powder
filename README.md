@@ -8,6 +8,17 @@ Inspired by [DAN-BALL Powder Game](https://dan-ball.jp/en/javagame/dust/).
 This is an independent implementation with its own code and visuals; it does
 not include the original game's source or assets.
 
+## Screenshots
+
+The starter scene includes a fan-driven wheel, a tumbling box, a bubble,
+water, growing plants and jointed stickmen.
+
+![Starter scene with materials, interactive objects and stickmen](docs/screenshots/starter-scene.png)
+
+Native gameplay on the Surface Pro 4, with touch controls and a saved sandbox scene.
+
+![Surface Pro 4 gameplay showing powder, water, platforms and stickmen](docs/screenshots/surface-gameplay.png)
+
 ## Features
 
 - 400×300 simulation with **50 materials and tools**, arranged across three palette pages.
