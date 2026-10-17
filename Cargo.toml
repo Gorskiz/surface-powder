@@ -1,0 +1,16 @@
+[package]
+name = "surface-powder"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "A lightweight native falling-sand sandbox with neon particles and stickmen"
+repository = "https://github.com/Gorskiz/surface-powder"
+
+[dependencies]
+sdl2 = "=0.38.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
