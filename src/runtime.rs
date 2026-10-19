@@ -21,7 +21,7 @@ pub struct Runtime {
     thread: Option<JoinHandle<World>>,
 }
 impl Runtime {
-    pub fn start(mut world: World) -> Self {
+    pub fn start(mut world: World, stress: bool) -> Self {
         let mut display = World::new(world.width, world.height);
         display.copy_visual_from(&world);
         let display = Arc::new(Mutex::new(display));
@@ -37,6 +37,9 @@ impl Runtime {
             let mut radius = 3;
             let mut pending = None;
             let mut dirty = false;
+            let mut updates = 0u64;
+            let mut timings = Vec::new();
+            let mut batch_start = Instant::now();
             'run: loop {
                 for command in pending.take().into_iter().chain(receive.try_iter()) {
                     match command {
@@ -64,7 +67,32 @@ impl Runtime {
                     for &stroke in &strokes {
                         pour_world(&mut world, stroke, radius);
                     }
+                    if stress && updates % 60 == 0 {
+                        // Refill gaps only in this diagnostic workload to sustain density.
+                        for cell in &mut world.cells {
+                            if cell.material == crate::sim::Material::Empty {
+                                *cell = crate::sim::Cell::new(crate::sim::Material::Water);
+                            }
+                        }
+                        crate::inject_dense_explosion(&mut world);
+                    }
+                    let measured = stress.then(Instant::now);
                     world.step(input);
+                    updates += 1;
+                    if let Some(start) = measured {
+                        timings.push(start.elapsed());
+                        if timings.len() == 240 {
+                            timings.sort_unstable();
+                            let ms = |d: Duration| d.as_secs_f64() * 1000.;
+                            eprintln!("powder: stress physics rate={:.2}Hz mean={:.3}ms p95={:.3}ms max={:.3}ms late={}/240",
+                                240. / batch_start.elapsed().as_secs_f64(),
+                                timings.iter().map(|&d| ms(d)).sum::<f64>() / 240.,
+                                ms(timings[228]), ms(timings[239]),
+                                timings.iter().filter(|&&d| d > interval).count());
+                            timings.clear();
+                            batch_start = Instant::now();
+                        }
+                    }
                     dirty = true;
                     next += interval;
                     // A backlog never hides new input: service commands between every tick.
@@ -161,7 +189,7 @@ mod tests {
     use crate::sim::Material;
     #[test]
     fn queued_edits_survive_shutdown_in_order() {
-        let runtime = Runtime::start(World::new(32, 32));
+        let runtime = Runtime::start(World::new(32, 32), false);
         runtime
             .controls(Input::default(), true, Vec::new(), 3)
             .unwrap();
@@ -180,7 +208,7 @@ mod tests {
     }
     #[test]
     fn presentation_snapshot_is_available_while_simulation_is_busy() {
-        let runtime = Runtime::start(World::new(32, 32));
+        let runtime = Runtime::start(World::new(32, 32), false);
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         runtime
@@ -198,7 +226,7 @@ mod tests {
     }
     #[test]
     fn save_acknowledgement_follows_pending_edits() {
-        let runtime = Runtime::start(World::new(32, 32));
+        let runtime = Runtime::start(World::new(32, 32), false);
         runtime
             .controls(Input::default(), true, Vec::new(), 3)
             .unwrap();

@@ -28,7 +28,7 @@ Native gameplay on the Surface Pro 4, with touch controls and a saved sandbox sc
 - Six-joint players and fighters with foot-driven movement, floppy limbs and flying, shrinking body fragments on elimination.
 - Brush sizing, neon trails, airflow view, touch controls, and an interactive starter scene.
 - Automatic scene persistence, including wind and object state.
-- Physics runs on its own worker targeting 60 Hz, independently of input and rendering. Native rendering is capped at approximately 30 frames per second.
+- Physics runs on its own worker targeting 60 Hz, independently of input and rendering. Rendering synchronizes to the display refresh rate (60 Hz on the Surface), with a 60 FPS fallback.
 - No browser, game engine, account or network connection required to play.
 
 The palette includes powder, water, fire, seeds, gunpowder, fans, ice,
@@ -179,33 +179,51 @@ cargo run --release --locked -- --benchmark-dense --world /path/to/world.bin
 ```
 
 Physics runs on a dedicated worker targeting 60 Hz, with the same ordered
-particle updates. Input and native presentation run independently at approximately
-30 FPS and read the latest available snapshot without waiting for physics.
+particle updates. Input and native presentation run independently, using vsync
+on the Surface’s 60 Hz display and a 60 FPS timer when vsync is unavailable.
+Presentation reads the latest available snapshot without waiting for physics.
 Drawing, object creation and saves remain ordered on the worker; shutdown waits
 for pending edits before saving the actual simulation. `--profile-frames` logs
 presentation frame intervals, including SDL work and frame pacing.
 
-Measured on the Debian Surface Pro 4 (240 updates per case):
+For an interactive sustained stress test:
 
-| Scene | Previous mean | Optimized mean | Optimized p95 | Optimized max |
-| --- | ---: | ---: | ---: | ---: |
-| Full-screen water | 19.68 ms | 4.35 ms | 5.12 ms | 6.49 ms |
-| Existing dense liquid save | 115.34 ms | 4.28 ms | 5.00 ms | 6.13 ms |
-| Water + repeated 2,500-charge explosions | — | 18.92 ms | 21.92 ms | 27.74 ms |
+```sh
+cargo run --release --locked -- --stress-dense --frames 3600 --profile-frames
+```
 
-A separate 300-frame Wayland/OpenGL run with full-screen water and an initial
-2,500-charge explosion held approximately 30 FPS: frame intervals averaged
-33.13 ms, with a 34.06 ms maximum. This is one measured workload, not an
-unlimited-load guarantee.
+This starts with 120,000 water cells, injects 2,500 nitro charges every 60 physics
+updates, and refills empty cells at each burst to sustain density. It reports
+physics rate and update times independently of display frame intervals. It does
+not load or overwrite the player's saved scene. Glyph pixels are submitted in
+batches; glow decay keeps its original elapsed-time cadence at the higher FPS.
 
-These are simulation timings, excluding presentation. Full-water state and
-trajectory digests match the reference update exactly. Existing saves can differ
-because of the subnormal cleanup described above. The repeated-explosion case
-still exceeds the 16.67 ms budget for 60 physics updates per second. Separating
-presentation prevents an expensive physics update from blocking the UI; it does
-not make the simulation instantaneous. Chain reactions retain the existing
-64-detonation-per-update budget and save pending detonations. Extreme workloads
-can still slow simulation; finite hardware cannot guarantee zero latency.
+Measured on the Debian Surface Pro 4 with Wayland/OpenGL and the **balanced**
+power profile: the live test sustained approximately 60 display FPS and 60
+physics updates per second over 3,600 displayed frames. Physics averaged 7.68 ms
+across 3,360 reported updates. Display intervals averaged 16.63 ms; after the
+first 150 frames, the worst interval was 24.46 ms. One startup interval took
+57.26 ms. Twenty-one physics updates exceeded 16.67 ms (maximum 33.96 ms), while
+the worker recovered its 60 Hz rate and presentation remained independent.
+
+The power profile is decisive: power-saver held the plugged-in CPU around
+900 MHz under load. A two-run comparison with both binaries in balanced mode
+measured 7.00 ms per water/explosion update for the previous binary and 6.44 ms
+for this version,
+with identical state and trajectory hashes. The earlier measurement was
+18.92 ms under power-saver. Most of the Surface improvement comes from allowing
+the CPU to run normally and removing the old 30 FPS presentation cap. The game does not
+change system power profiles or disable thermal/battery protection.
+
+Full-water and repeated-explosion state/trajectory digests match the previous
+binary exactly. Existing legacy scenes can still differ because of the
+subnormal cleanup described above. Resolution, particle capacity, impulses,
+material rules and random draw order are retained. Chain reactions keep the
+existing 64-detonation-per-update budget and save pending detonations. These
+measurements demonstrate a sustained workload, not a guarantee against all OS
+scheduling stalls, thermal limits or arbitrary scenes.
+
+![Full-screen water and repeated explosions during the Surface 60 FPS stress test](docs/screenshots/dense-explosions.png)
 
 ## License
 

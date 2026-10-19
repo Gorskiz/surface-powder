@@ -1206,8 +1206,14 @@ impl World {
     }
     #[inline(always)]
     fn enclosed_motion(&mut self, i: usize, step: MotionStep) {
-        let dx = step.vx * step.steps as f32 / step.steps as f32 + step.fraction;
-        let dy = step.vy * step.steps as f32 / step.steps as f32 + step.fraction;
+        let (dx, dy) = if step.steps == 1 {
+            (step.vx + step.fraction, step.vy + step.fraction)
+        } else {
+            (
+                step.vx * step.steps as f32 / step.steps as f32 + step.fraction,
+                step.vy * step.steps as f32 / step.steps as f32 + step.fraction,
+            )
+        };
         if !(0. ..1.).contains(&dx) || !(0. ..1.).contains(&dy) {
             self.motion[i].vx *= 0.15;
             self.motion[i].vy *= 0.15;

@@ -42,11 +42,12 @@ fn rgb(value: u32) -> Color {
 }
 fn text(c: &mut Render, x: i32, y: i32, s: &str, color: u32, scale: u32) {
     c.set_draw_color(rgb(color));
+    let mut rectangles = Vec::with_capacity(s.len() * 20);
     for (i, ch) in s.chars().enumerate() {
         for (row, bits) in font::glyph(ch).iter().enumerate() {
             for col in 0..5 {
                 if bits & (1 << (4 - col)) != 0 {
-                    let _ = c.fill_rect(Rect::new(
+                    rectangles.push(Rect::new(
                         x + i as i32 * 6 * scale as i32 + col * scale as i32,
                         y + row as i32 * scale as i32,
                         scale,
@@ -56,6 +57,7 @@ fn text(c: &mut Render, x: i32, y: i32, s: &str, color: u32, scale: u32) {
             }
         }
     }
+    let _ = c.fill_rects(&rectangles);
 }
 fn button(c: &mut Render, rect: Rect, label: &str, color: u32, active: bool) {
     c.set_draw_color(rgb(if active { 0x263342 } else { 0x111722 }));
@@ -236,9 +238,9 @@ impl App {
     fn change_page(&mut self, delta: isize) {
         self.page = (self.page as isize + delta).rem_euclid(page_count() as isize) as usize;
     }
-    fn threaded(world: World) -> Result<Self, String> {
+    fn threaded(world: World, stress: bool) -> Result<Self, String> {
         let mut visual = World::new(world.width, world.height);
-        let runtime = runtime::Runtime::start(world);
+        let runtime = runtime::Runtime::start(world, stress);
         runtime.copy_latest(&mut visual)?;
         let mut app = Self::new(visual);
         app.runtime = Some(runtime);
@@ -633,7 +635,13 @@ fn main() -> Result<(), String> {
         .build()
         .map_err(|e| e.to_string())?;
     eprintln!("powder: fullscreen window ready");
-    let mut c = window.into_canvas().build().map_err(|e| e.to_string())?;
+    let mut c = window
+        .into_canvas()
+        .present_vsync()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let vsync =
+        c.info().flags & sdl2::sys::SDL_RendererFlags::SDL_RENDERER_PRESENTVSYNC as u32 != 0;
     eprintln!("powder: renderer ready ({})", c.info().name);
     c.set_logical_size(VIEW_W, VIEW_H)
         .map_err(|e| e.to_string())?;
@@ -641,18 +649,28 @@ fn main() -> Result<(), String> {
     let mut texture = creator
         .create_texture_streaming(PixelFormatEnum::RGB888, WIDTH as u32, HEIGHT as u32)
         .map_err(|e| e.to_string())?;
-    let path = state_path();
-    let world = match World::load(&path) {
-        Ok(w) if w.width == WIDTH && w.height == HEIGHT => w,
-        Ok(_) => return Err("Saved world has unexpected dimensions".into()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let mut w = World::new(WIDTH, HEIGHT);
-            w.seed_demo();
-            w
-        }
-        Err(e) => return Err(format!("Save could not be loaded (preserved): {e}")),
+    let stress = args.iter().any(|s| s == "--stress-dense");
+    // Diagnostic scenes never overwrite a player's save, including manual saves.
+    let path = if stress {
+        std::env::temp_dir().join(format!("powder-stress-{}.bin", std::process::id()))
+    } else {
+        state_path()
     };
-    let mut app = App::threaded(world)?;
+    let world = if stress {
+        dense_water()
+    } else {
+        match World::load(&path) {
+            Ok(w) if w.width == WIDTH && w.height == HEIGHT => w,
+            Ok(_) => return Err("Saved world has unexpected dimensions".into()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let mut w = World::new(WIDTH, HEIGHT);
+                w.seed_demo();
+                w
+            }
+            Err(e) => return Err(format!("Save could not be loaded (preserved): {e}")),
+        }
+    };
+    let mut app = App::threaded(world, stress)?;
     let mut events = ctx.event_pump()?;
     let mut pixels = vec![0u32; WIDTH * HEIGHT];
     let mut trails = vec![0u32; WIDTH * HEIGHT];
@@ -670,6 +688,9 @@ fn main() -> Result<(), String> {
     let profile_frames = args.iter().any(|s| s == "--profile-frames");
     let mut frame_times = Vec::new();
     let mut previous_frame = Instant::now();
+    let trail_interval = Duration::from_nanos(33_333_333);
+    let mut next_trail = Instant::now() + trail_interval;
+    let mut next_frame = Instant::now();
     let mut counts = 0;
     eprintln!("powder: scene loaded; entering main loop");
     'running: while !QUIT.load(Ordering::Relaxed) {
@@ -784,11 +805,23 @@ fn main() -> Result<(), String> {
             }
         }
         app.world.render(&mut pixels);
+        let now = Instant::now();
+        let fade_trail = now >= next_trail;
+        if fade_trail {
+            next_trail += trail_interval;
+            if next_trail < now {
+                next_trail = now + trail_interval;
+            }
+        }
         for (p, t) in pixels.iter_mut().zip(&mut trails) {
             if app.glow {
-                let faded = ((((*t >> 16) & 255) * 4 / 5) << 16)
-                    | ((((*t >> 8) & 255) * 4 / 5) << 8)
-                    | ((*t & 255) * 4 / 5);
+                let faded = if fade_trail {
+                    ((((*t >> 16) & 255) * 4 / 5) << 16)
+                        | ((((*t >> 8) & 255) * 4 / 5) << 8)
+                        | ((*t & 255) * 4 / 5)
+                } else {
+                    *t
+                };
                 *p = ((*p & 0xff0000).max(faded & 0xff0000))
                     | ((*p & 0xff00).max(faded & 0xff00))
                     | ((*p & 255).max(faded & 255));
@@ -803,7 +836,7 @@ fn main() -> Result<(), String> {
                 }
             }
         })?;
-        if frames % 30 == 0 {
+        if frames % 60 == 0 {
             counts = app
                 .world
                 .cells
@@ -836,11 +869,18 @@ fn main() -> Result<(), String> {
         if finishing {
             break;
         }
-        if last_save.elapsed() > Duration::from_secs(30) {
+        if !stress && last_save.elapsed() > Duration::from_secs(30) {
             app.request_save(&path, false);
             last_save = Instant::now();
         }
-        std::thread::sleep(Duration::from_millis(33).saturating_sub(frame.elapsed()));
+        if !vsync {
+            next_frame += Duration::from_nanos(16_666_667);
+            let now = Instant::now();
+            if next_frame < now {
+                next_frame = now;
+            }
+            std::thread::sleep(next_frame.saturating_duration_since(now));
+        }
     }
     if profile_frames && !frame_times.is_empty() {
         report_frames(&mut frame_times);
@@ -850,9 +890,18 @@ fn main() -> Result<(), String> {
     } else {
         app.world
     };
-    let result = save_world(&world, &path);
-    if result == "SAVE FAILED" {
-        return Err(result);
+    if !stress {
+        let result = save_world(&world, &path);
+        if result == "SAVE FAILED" {
+            return Err(result);
+        }
+    }
+    // SDL 2.32 on the Surface crashes while destroying its Wayland renderer
+    // after the last output disappears. The worker is joined and the save is
+    // fsynced above; let the OS release graphics resources in this one case.
+    #[cfg(target_os = "linux")]
+    if video.num_video_displays().is_ok_and(|count| count == 0) {
+        std::process::exit(0);
     }
     Ok(())
 }
@@ -860,10 +909,14 @@ fn report_frames(times: &mut Vec<Duration>) {
     times.sort_unstable();
     let ms = |d: Duration| d.as_secs_f64() * 1000.;
     eprintln!(
-        "powder: frame interval mean={:.3}ms p95={:.3}ms max={:.3}ms ({} frames)",
+        "powder: frame interval mean={:.3}ms p95={:.3}ms max={:.3}ms >25ms={}/{}",
         times.iter().map(|&d| ms(d)).sum::<f64>() / times.len() as f64,
         ms(times[times.len() * 95 / 100]),
         ms(*times.last().unwrap()),
+        times
+            .iter()
+            .filter(|&&d| d > Duration::from_millis(25))
+            .count(),
         times.len()
     );
     times.clear();
@@ -885,6 +938,19 @@ fn benchmark() -> Result<(), String> {
     );
     Ok(())
 }
+fn dense_water() -> World {
+    let mut world = World::new(WIDTH, HEIGHT);
+    world.cells.fill(sim::Cell::new(Material::Water));
+    world
+}
+fn inject_dense_explosion(world: &mut World) {
+    for y in 125..175 {
+        for x in 175..225 {
+            world.cells[y * WIDTH + x] = sim::Cell::new(Material::Nitro);
+        }
+    }
+    world.apply_pressure(200, 150, 40, 10.);
+}
 /// Stage timings plus an exact serialized-state digest allow before/after comparisons.
 fn benchmark_dense(saved_world: Option<&String>) -> Result<(), String> {
     use std::hash::{Hash, Hasher};
@@ -895,24 +961,9 @@ fn benchmark_dense(saved_world: Option<&String>) -> Result<(), String> {
         let mut world = if scene == "saved-scene" {
             World::load(saved_world.unwrap()).map_err(|e| e.to_string())?
         } else {
-            let mut w = World::new(WIDTH, HEIGHT);
-            for y in 0..HEIGHT as i32 {
-                w.paint_line(0, y, WIDTH as i32 - 1, y, 0, Material::Water);
-            }
+            let mut w = dense_water();
             if scene == "water-explosions" {
-                for y in 125..175 {
-                    for x in 175..225 {
-                        w.cells[y * WIDTH + x] = sim::Cell::new(Material::Nitro);
-                    }
-                }
-                assert_eq!(
-                    w.cells
-                        .iter()
-                        .filter(|c| c.material == Material::Nitro)
-                        .count(),
-                    2500
-                );
-                w.apply_pressure(200, 150, 40, 10.);
+                inject_dense_explosion(&mut w);
             }
             w
         };
@@ -923,12 +974,7 @@ fn benchmark_dense(saved_world: Option<&String>) -> Result<(), String> {
         let mut trajectory = std::collections::hash_map::DefaultHasher::new();
         for tick in 0..240 {
             if scene == "water-explosions" && tick != 0 && tick % 60 == 0 {
-                for y in 125..175 {
-                    for x in 175..225 {
-                        world.cells[y * WIDTH + x] = sim::Cell::new(Material::Nitro);
-                    }
-                }
-                world.apply_pressure(200, 150, 40, 10.);
+                inject_dense_explosion(&mut world);
             }
             let start = Instant::now();
             let parts = world.step_profiled(Input::default());
@@ -1032,7 +1078,7 @@ mod tests {
     use super::*;
     #[test]
     fn threaded_gestures_and_payload_survive_immediate_shutdown() {
-        let mut app = App::threaded(World::new(WIDTH, HEIGHT)).unwrap();
+        let mut app = App::threaded(World::new(WIDTH, HEIGHT), false).unwrap();
         app.runtime
             .as_ref()
             .unwrap()
