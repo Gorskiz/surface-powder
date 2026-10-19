@@ -2085,8 +2085,19 @@ impl World {
         self.tick = other.tick;
     }
     pub fn render(&self, pixels: &mut [u32]) {
+        crate::visuals::render_air(&self.air, pixels, self.width, self.height);
+        self.draw_particles(pixels);
+    }
+    pub fn render_particles(&self, pixels: &mut [u32]) {
+        pixels.fill(0);
+        self.draw_particles(pixels);
+    }
+    fn draw_particles(&self, pixels: &mut [u32]) {
         assert_eq!(pixels.len(), self.cells.len());
         for (i, (pixel, cell)) in pixels.iter_mut().zip(&self.cells).enumerate() {
+            if cell.material == Material::Empty {
+                continue;
+            }
             let base = cell.material.color();
             *pixel = if cell.material == Material::Fire {
                 if (cell.life as usize + i) % 3 == 0 {

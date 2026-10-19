@@ -19,11 +19,16 @@ Native gameplay on the Surface Pro 4, with touch controls and a saved sandbox sc
 
 ![Surface Pro 4 gameplay showing powder, water, platforms and stickmen](docs/screenshots/surface-gameplay.png)
 
+C4's pressure and wind wave, rendered on the Surface with the new blast background.
+
+![C4 blast forming a chromatic butterfly-shaped pressure and wind wave](docs/screenshots/c4-pressure-wave.png)
+
 ## Features
 
 - 400×300 simulation with **50 materials and tools**, arranged across three palette pages.
 - Momentum-carrying wind and pressure waves with smooth sampling and obstacle deflection.
 - Directional fans and pumps; explosions throw particles, bodies and characters outward.
+- The original-style chromatic blast view: green compression, blue suction and dense red wind streaks form expanding butterfly-shaped waves, including C4 blasts.
 - Anchored spinning wheels, tumbling boxes, material-carrying balls, and floating bubbles.
 - Six-joint players and fighters with foot-driven movement, floppy limbs and flying, shrinking body fragments on elimination.
 - Brush sizing, neon trails, airflow view, touch controls, and an interactive starter scene.
@@ -102,8 +107,12 @@ Air + / Air − button beside Flow to switch between pressure and suction. Set R
 material payload for subsequently placed fireworks and balls, as well as the
 right mouse brush. Selecting Erase as the secondary resets payloads to powder.
 Fireworks launch when ignited; balls release their payload on impact. Gunpowder, C4 and nitro throw existing grains outward; gas mostly ignites and adds pressure. Bomb instead pulls a small cloud inward before the affected grains decay. The
-Flow overlay shows velocity arrows, green positive pressure and blue negative
-pressure. The default demo includes a fan-driven gear and movable objects.
+blast background is always visible: green positive pressure, blue negative
+pressure and red wind streaks, with particles and objects drawn in front. It
+uses the original's default BG-line colour and streak rules; its wave evolution
+follows this game's air solver. Glow adds particle trails without retaining old
+pressure colours. Flow adds the optional velocity arrows. The default demo
+includes a fan-driven gear and movable objects.
 
 The Demo button
 replaces the current world immediately; it is not an additional save slot.
@@ -130,12 +139,13 @@ cargo clippy --locked -- -D warnings
 cargo run --release --locked -- --benchmark
 cargo run --release --locked -- --benchmark-stress
 cargo run --release --locked -- --benchmark-dense
+cargo run --release --locked -- --benchmark-waves
 ```
 
 On macOS, use the same `RUSTFLAGS` setting from the build command for commands
 that link the executable. Tests cover articulated movement and fragmentation, particle momentum and conservation,
 barriers, wind transport, pressure waves, wheel torque,
-body collision, bubble popping, material payloads, chemistry, electricity,
+body collision, bubble popping, pressure-wave colours and layering, material payloads, chemistry, electricity,
 legacy-save migration, deterministic save/load continuation and touch input.
 
 For a headless rendering check:
@@ -171,6 +181,19 @@ full 120,000-cell water scene and water with either 2,500 central nitro charges
 or 32,000 distributed charges injected every 60 updates. It reports mean, 95th-percentile and maximum update times, stage
 breakdowns, rendering time and state/trajectory digests. All benchmarks exclude
 SDL presentation and UI drawing; setup is outside timed updates.
+
+`--benchmark-waves` measures the actual game rendering path, including particle
+glow and background composition, for idle air, an evolving C4 blast and two
+synthetic cases with maximum wind/pressure in every one of the 7,500 air cells
+(empty and full of water). It reports mean, 95th-percentile and maximum render
+times over 600 frames per case. Add `--screenshot wave.ppm` to export a C4 frame.
+It excludes SDL upload, UI and presentation; live stress runs measure those too.
+
+The wave background reads the existing air snapshot without advancing or
+changing physics. It uses a reusable 480,000-byte buffer, four-pixel pressure
+tiles, and at most one wind streak (up to 84 raster samples) per air cell. There are no extra SDL
+draw calls or per-frame allocations for the effect, and its cost does not grow
+with the number of explosions.
 
 To profile an existing save without modifying it:
 
@@ -230,18 +253,30 @@ Measured on the Debian Surface Pro 4, Wayland/OpenGL, with that hold active:
 
 | Live workload | Displayed frames | Mean tick | Worst tick | Updates over 16.67 ms | Worst frame interval |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 2,500-charge bursts | 3,600 | 7.02 ms | 13.60 ms | 0 / 3,360 reported | 19.15 ms |
-| 32,000-charge distributed bursts | 7,200 | 4.79 ms | 12.15 ms | 0 / 6,960 reported | 19.71 ms |
+| 2,500-charge bursts with wave visuals | 3,600 | 7.34 ms | 25.67 ms | 3 / 3,360 reported | 18.28 ms |
+| 32,000-charge distributed bursts with wave visuals | 7,200 | 4.73 ms | 17.83 ms | 1 / 6,960 reported | 19.98 ms |
 
 Both maintained approximately 60 display FPS and 60 physics updates per second,
-with no frame intervals over 25 ms. Preparation took about 185–188 ms in the
-native process; the first animated frame took 16.5–16.6 ms. This moves cold
-Wayland initialization before animation; it does not make process startup
-instantaneous. More charges can be cheaper per update because pending charges
-wait under the same existing detonation budget.
+with no display frame intervals over 25 ms. The four late physics ticks spent
+6.8–14.0 ms waiting to run; their measured thread CPU work was 6.4–11.7 ms.
+These scheduling stalls are retained in the results rather than excluded.
+The effect fits the rendering budget, but these measurements do not establish
+an absolute physics deadline guarantee. More charges can be cheaper per update
+because pending charges wait under the same existing detonation budget.
 
-Full-water and repeated-explosion state/trajectory digests still match the
-previous binary exactly. The earlier subnormal cleanup can still affect legacy
+The separate 600-frame render test measured the complete pixel rendering,
+particle trails and background composition (excluding SDL/UI/presentation):
+
+| Render workload | Mean | 95th percentile | Maximum |
+| --- | ---: | ---: | ---: |
+| Idle air | 0.82 ms | 1.06 ms | 2.25 ms |
+| Evolving C4 wave | 1.08 ms | 1.49 ms | 1.95 ms |
+| Maximum wind and pressure in all 7,500 cells | 2.42 ms | 2.90 ms | 4.05 ms |
+| Full water with maximum air | 2.16 ms | 2.52 ms | 3.15 ms |
+
+Full-water and repeated-explosion serialized-state and physical digests still
+match the previous binary exactly. Visual trajectory digests change where the
+new background is visible. The earlier subnormal cleanup can still affect legacy
 saves as described above. Measurements cover these sustained workloads; they do
 not guarantee deadlines under arbitrary OS load, power saving or thermal limits.
 

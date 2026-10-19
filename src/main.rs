@@ -2,6 +2,7 @@ mod font;
 mod physics;
 mod runtime;
 mod sim;
+mod visuals;
 
 use sdl2::{
     event::Event,
@@ -608,9 +609,53 @@ fn upload_pixels(texture: &mut sdl2::render::Texture, pixels: &[u32]) -> Result<
         }
     })
 }
+fn composite_air(pixels: &mut [u32], air: &[u32], world: &World) {
+    for ((pixel, &background), cell) in pixels.iter_mut().zip(air).zip(&world.cells) {
+        if cell.material == Material::Empty {
+            *pixel = ((*pixel & 0xff0000).max(background & 0xff0000))
+                | ((*pixel & 0xff00).max(background & 0xff00))
+                | ((*pixel & 255).max(background & 255));
+        }
+    }
+}
+fn render_scene(
+    world: &World,
+    pixels: &mut [u32],
+    air: &mut [u32],
+    trails: &mut [u32],
+    glow: bool,
+    fade_trail: bool,
+) {
+    world.render_particles(pixels);
+    for (p, t) in pixels.iter_mut().zip(trails) {
+        if glow {
+            let faded = if fade_trail {
+                ((((*t >> 16) & 255) * 4 / 5) << 16)
+                    | ((((*t >> 8) & 255) * 4 / 5) << 8)
+                    | ((*t & 255) * 4 / 5)
+            } else {
+                *t
+            };
+            *p = ((*p & 0xff0000).max(faded & 0xff0000))
+                | ((*p & 0xff00).max(faded & 0xff00))
+                | ((*p & 255).max(faded & 255));
+        }
+        *t = *p;
+    }
+    // Pressure follows the current air snapshot, never the particle trail.
+    visuals::render_air(&world.air, air, world.width, world.height);
+    composite_air(pixels, air, world);
+}
 fn main() -> Result<(), String> {
     let launched = Instant::now();
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|s| s == "--benchmark-waves") {
+        return benchmark_waves(
+            args.iter()
+                .position(|s| s == "--screenshot")
+                .and_then(|i| args.get(i + 1)),
+        );
+    }
     if args.iter().any(|s| s == "--benchmark-dense") {
         return benchmark_dense(
             args.iter()
@@ -691,6 +736,7 @@ fn main() -> Result<(), String> {
     let mut app = App::threaded(world, stress)?;
     let mut events = ctx.event_pump()?;
     let mut pixels = vec![0u32; WIDTH * HEIGHT];
+    let mut air_pixels = vec![0u32; WIDTH * HEIGHT];
     let mut trails = vec![0u32; WIDTH * HEIGHT];
     let mut last_save = Instant::now();
     let mut frames = 0u64;
@@ -722,8 +768,14 @@ fn main() -> Result<(), String> {
     }
     // Load the texture, shaders and Wayland frame queue before any physics advances.
     let startup_notice = std::mem::replace(&mut app.notice, "STARTING".into());
-    app.world.render(&mut pixels);
-    trails.copy_from_slice(&pixels);
+    render_scene(
+        &app.world,
+        &mut pixels,
+        &mut air_pixels,
+        &mut trails,
+        app.glow,
+        false,
+    );
     upload_pixels(&mut texture, &pixels)?;
     for pass in 1..=4 {
         if QUIT.load(Ordering::Relaxed) {
@@ -865,7 +917,6 @@ fn main() -> Result<(), String> {
         }
         let tracing_startup = profile_frames && frames < 5;
         let rendering = tracing_startup.then(Instant::now);
-        app.world.render(&mut pixels);
         let now = Instant::now();
         let fade_trail = now >= next_trail;
         if fade_trail {
@@ -874,21 +925,14 @@ fn main() -> Result<(), String> {
                 next_trail = now + trail_interval;
             }
         }
-        for (p, t) in pixels.iter_mut().zip(&mut trails) {
-            if app.glow {
-                let faded = if fade_trail {
-                    ((((*t >> 16) & 255) * 4 / 5) << 16)
-                        | ((((*t >> 8) & 255) * 4 / 5) << 8)
-                        | ((*t & 255) * 4 / 5)
-                } else {
-                    *t
-                };
-                *p = ((*p & 0xff0000).max(faded & 0xff0000))
-                    | ((*p & 0xff00).max(faded & 0xff00))
-                    | ((*p & 255).max(faded & 255));
-            }
-            *t = *p;
-        }
+        render_scene(
+            &app.world,
+            &mut pixels,
+            &mut air_pixels,
+            &mut trails,
+            app.glow,
+            fade_trail,
+        );
         let rendered = tracing_startup.then(Instant::now);
         upload_pixels(&mut texture, &pixels)?;
         if frames % 60 == 0 {
@@ -998,6 +1042,68 @@ fn benchmark() -> Result<(), String> {
         start.elapsed().as_secs_f64() * 1000. / 900.,
         std::mem::size_of_val(world.cells.as_slice())
     );
+    Ok(())
+}
+/// Exercise the actual presentation path, including glow/composition, without SDL.
+fn benchmark_waves(screenshot: Option<&String>) -> Result<(), String> {
+    for scene in ["idle-air", "c4-wave", "maximum-air", "water-maximum-air"] {
+        let mut world = World::new(WIDTH, HEIGHT);
+        if scene == "water-maximum-air" {
+            world.cells.fill(sim::Cell::new(Material::Water));
+        }
+        if scene == "c4-wave" {
+            for y in 130..154 {
+                world.paint_line(160, y, 239, y, 0, Material::C4);
+            }
+            world.paint_line(158, 142, 161, 142, 1, Material::Fire);
+        } else if scene.ends_with("maximum-air") {
+            for (i, node) in world.air.nodes.iter_mut().enumerate() {
+                node.vx = if i % 2 == 0 { 12. } else { -12. };
+                node.vy = if i % 3 == 0 { 12. } else { -12. };
+                node.pressure = if i % 2 == 0 { 20. } else { -20. };
+            }
+        }
+        let mut pixels = vec![0; WIDTH * HEIGHT];
+        let mut air = vec![0; WIDTH * HEIGHT];
+        let mut trails = vec![0; WIDTH * HEIGHT];
+        let mut times = Vec::with_capacity(600);
+        for frame in 0..600 {
+            if scene == "c4-wave" {
+                world.step(Input::default());
+            }
+            let start = Instant::now();
+            render_scene(
+                &world,
+                &mut pixels,
+                &mut air,
+                &mut trails,
+                true,
+                frame % 2 == 0,
+            );
+            std::hint::black_box(&pixels);
+            times.push(start.elapsed());
+            if scene == "c4-wave" && frame == 40 {
+                if let Some(path) = screenshot {
+                    use std::io::Write;
+                    let mut f = std::fs::File::create(path).map_err(|e| e.to_string())?;
+                    write!(f, "P6\n{WIDTH} {HEIGHT}\n255\n").map_err(|e| e.to_string())?;
+                    for &p in &pixels {
+                        f.write_all(&[(p >> 16) as u8, (p >> 8) as u8, p as u8])
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+        }
+        times.sort_unstable();
+        let ms = |d: Duration| d.as_secs_f64() * 1000.;
+        println!(
+            "{scene}: complete render mean={:.3}ms p95={:.3}ms max={:.3}ms; air nodes={}",
+            times.iter().map(|&d| ms(d)).sum::<f64>() / times.len() as f64,
+            ms(times[times.len() * 95 / 100]),
+            ms(*times.last().unwrap()),
+            world.air.nodes.len()
+        );
+    }
     Ok(())
 }
 fn dense_water() -> World {
@@ -1149,6 +1255,25 @@ fn benchmark_stress() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pressure_background_keeps_particles_visible_and_never_enters_glow_trails() {
+        let mut world = World::new(16, 16);
+        world.air.nodes[0].pressure = 2.;
+        world.cells[0] = sim::Cell::new(Material::Water);
+        let mut pixels = vec![0; 256];
+        let mut air = vec![0; 256];
+        let mut trails = vec![0; 256];
+        render_scene(&world, &mut pixels, &mut air, &mut trails, true, false);
+        assert_eq!(pixels[0], Material::Water.color());
+        assert_eq!(pixels[1], 0x006000);
+        assert_eq!(trails[1], 0);
+        world.air.clear();
+        render_scene(&world, &mut pixels, &mut air, &mut trails, true, false);
+        assert_eq!(pixels[1], 0);
+        assert_eq!(pixels[0], Material::Water.color());
+        render_scene(&world, &mut pixels, &mut air, &mut trails, false, false);
+        assert_eq!(pixels[0], Material::Water.color());
+    }
     #[test]
     fn threaded_gestures_and_payload_survive_immediate_shutdown() {
         let mut app = App::threaded(World::new(WIDTH, HEIGHT), None).unwrap();
