@@ -122,6 +122,14 @@ replaces the current world immediately; it is not an additional save slot.
 The scene saves every 30 seconds, when you press Save, and on normal exit,
 SIGINT or SIGTERM. It reloads at startup.
 
+The simulation captures each save point in memory, then a separate writer does
+the filesystem reads, backup, disk flush and atomic rename. A slow disk cannot
+block physics updates. Repeated pending saves to the same slot keep the latest
+snapshot; a manual-save acknowledgement is retained. Shutdown drains accepted
+writes before saving the final simulation state. Tests block actual filesystem
+I/O with a FIFO while verifying that later edits still run and the saved scene
+retains the requested earlier state.
+
 Default location: `~/.local/state/surface-powder/world.bin`. Setting
 `XDG_STATE_HOME` moves it to `$XDG_STATE_HOME/surface-powder/world.bin`.
 Version 1 saves load automatically; the first upgraded save creates a
@@ -205,8 +213,8 @@ Physics runs on a dedicated worker targeting 60 Hz, with the same ordered
 particle updates. Input and native presentation run independently, using vsync
 on the Surface’s 60 Hz display and a 60 FPS timer when vsync is unavailable.
 Presentation reads the latest available snapshot without waiting for physics.
-Drawing, object creation and saves remain ordered on the worker; shutdown waits
-for pending edits before saving the actual simulation. `--profile-frames` logs
+Drawing, object creation and save snapshots remain ordered on the worker.
+Shutdown waits for pending edits before saving the actual simulation. `--profile-frames` logs
 presentation frame intervals, including SDL work and frame pacing.
 
 Before animation starts, the game prepares collision/air caches, writable
@@ -233,6 +241,7 @@ For sustained interactive stress tests:
 ```sh
 ./scripts/run-game.sh --stress-dense --frames 3600 --profile-frames
 ./scripts/run-game.sh --stress-extreme --frames 7200 --profile-frames
+./scripts/run-game.sh --stress-dense --stress-saves --frames 18000 --profile-frames
 ```
 
 Both start with 120,000 water cells and refill empty cells at each burst. Dense
@@ -240,29 +249,54 @@ injects 2,500 nitro charges every 60 physics updates; extreme injects 32,000 in
 64 patches across the screen. The existing 64-detonation-per-update budget is
 unchanged. Neither test loads or overwrites the player's save. Live tick timings
 include refilling and injecting the test bursts. Linux diagnostics distinguish
-thread CPU time from elapsed time, preemptions and page faults; startup timings
-are reported separately from animated frames.
+thread CPU time from elapsed time, preemptions and page faults. Deadline timing
+also includes delay waking from the scheduled tick start. Whole-run totals
+include the final partial batch. Startup timings are reported separately from
+animated frames. `--stress-saves` adds a save request every two seconds to the
+diagnostic slot; it never changes the player's save or normal autosave interval.
 
-The remaining spikes on the Surface came from brief CPU clock drops even in
-balanced mode. A game-only performance hold removed them without changing
-material rules, forces, particle capacity, resolution or random draw order.
-The kiosk releases the hold on switching to Home Assistant. Its heat and battery
-guardian can still cancel the hold.
+The Surface uses a game-only performance hold to avoid CPU clock-ramp stalls;
+the kiosk releases it on switching to Home Assistant, and its heat/battery
+guardian can still cancel it. The host also selects the kernel's supported
+dynamic full-preemption mode so that ordinary kernel work can be preempted
+without waiting for a voluntary scheduling point. No CPU-frequency floor is set.
+See the kernel's
+[preempt= documentation](https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html).
 
-Measured on the Debian Surface Pro 4, Wayland/OpenGL, with that hold active:
+Full preemption alone did not eliminate the intermittent waits. The Surface
+kiosk additionally grants `LimitRTPRIO=1` and sets `SURFACE_POWDER_REALTIME=1`.
+This opt-in makes only the physics worker request Linux round-robin priority 1,
+the lowest real-time priority, with reset-on-fork. Render, driver and save threads
+keep their normal policies. The save thread is created before the request.
+The executable receives no capabilities and cannot raise its own resource limit;
+without the explicit allowance it continues with normal scheduling. Standard
+kernel real-time throttling remains enabled. See [Linux scheduling](https://man7.org/linux/man-pages/man7/sched.7.html).
 
-| Live workload | Displayed frames | Mean tick | Worst tick | Updates over 16.67 ms | Worst frame interval |
+These measures and the separate save writer preserve material rules, forces,
+particle capacity, resolution, random draw order and the chromatic wave effect.
+
+Measured on the Debian Surface Pro 4, Wayland/OpenGL, with full preemption,
+physics-only round-robin scheduling and the game performance hold active. All three
+runs kept the chromatic waves and wrote/fsynced a diagnostic save to the actual
+ext4 SSD every two seconds (the device's `/tmp` is RAM-backed):
+
+| Live workload | Displayed frames | Mean tick work | Worst completion including wake delay | Missed 16.67 ms physics deadlines | Worst frame interval |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 2,500-charge bursts with wave visuals | 3,600 | 7.34 ms | 25.67 ms | 3 / 3,360 reported | 18.28 ms |
-| 32,000-charge distributed bursts with wave visuals | 7,200 | 4.73 ms | 17.83 ms | 1 / 6,960 reported | 19.98 ms |
+| 2,500-charge bursts, five minutes | 18,000 | 7.14 ms | 12.96 ms | 0 / 17,937 | 28.12 ms |
+| 32,000-charge distributed bursts, three minutes | 10,800 | 4.21 ms | 12.53 ms | 0 / 10,772 | 20.81 ms |
+| 2,500-charge repeat after kiosk restart, five minutes | 18,000 | 7.20 ms | 12.71 ms | 0 / 17,932 | 23.76 ms |
 
-Both maintained approximately 60 display FPS and 60 physics updates per second,
-with no display frame intervals over 25 ms. The four late physics ticks spent
-6.8–14.0 ms waiting to run; their measured thread CPU work was 6.4–11.7 ms.
-These scheduling stalls are retained in the results rather than excluded.
-The effect fits the rendering budget, but these measurements do not establish
-an absolute physics deadline guarantee. More charges can be cheaper per update
-because pending charges wait under the same existing detonation budget.
+The runs averaged 60.21, 60.16 and 60.23 display FPS, respectively, and approximately
+60 physics updates per second. There were zero missed physics deadlines across
+all 46,641 updates, including the final partial batches. One of the 46,797
+display intervals exceeded 25 ms; this is not a perfectly locked display.
+The repeat also recorded scheduler events. DRM atomic-commit warnings continued
+after restart; their relationship to the single long frame interval remains
+unproven. The maximum physics completion across all three runs was 12.96 ms.
+The earlier wave build recorded four late physics ticks; full preemption alone
+also left an intermittent SSD-run deadline miss, which prompted the targeted
+worker policy. More charges can be cheaper per update because pending charges
+wait under the same existing detonation budget.
 
 The separate 600-frame render test measured the complete pixel rendering,
 particle trails and background composition (excluding SDL/UI/presentation):
@@ -274,9 +308,10 @@ particle trails and background composition (excluding SDL/UI/presentation):
 | Maximum wind and pressure in all 7,500 cells | 2.42 ms | 2.90 ms | 4.05 ms |
 | Full water with maximum air | 2.16 ms | 2.52 ms | 3.15 ms |
 
-Full-water and repeated-explosion serialized-state and physical digests still
-match the previous binary exactly. Visual trajectory digests change where the
-new background is visible. The earlier subnormal cleanup can still affect legacy
+Full-water and repeated-explosion serialized-state, physical and rendered-trajectory
+digests match the wave build (`9cc2a48`) exactly in all three benchmark scenes.
+These scheduling/save changes leave both physics and explosion effects unchanged.
+The earlier subnormal cleanup can still affect legacy
 saves as described above. Measurements cover these sustained workloads; they do
 not guarantee deadlines under arbitrary OS load, power saving or thermal limits.
 

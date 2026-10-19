@@ -1,4 +1,5 @@
 mod font;
+mod persistence;
 mod physics;
 mod runtime;
 mod sim;
@@ -713,6 +714,8 @@ fn main() -> Result<(), String> {
     } else {
         None
     };
+    let stress_saves = stress.is_some() && args.iter().any(|s| s == "--stress-saves");
+    let save_interval = Duration::from_secs(if stress_saves { 2 } else { 30 });
     // Diagnostic scenes never overwrite a player's save, including manual saves.
     let path = if stress.is_some() {
         std::env::temp_dir().join(format!("powder-stress-{}.bin", std::process::id()))
@@ -975,7 +978,7 @@ fn main() -> Result<(), String> {
         if finishing {
             break;
         }
-        if stress.is_none() && last_save.elapsed() > Duration::from_secs(30) {
+        if (stress.is_none() || stress_saves) && last_save.elapsed() > save_interval {
             app.request_save(&path, false);
             last_save = Instant::now();
         }

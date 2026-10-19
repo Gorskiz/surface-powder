@@ -485,21 +485,17 @@ impl World {
         }
     }
     pub fn save(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
-        use std::io::Write;
-        let path = path.as_ref();
-        // Keep the last legacy scene recoverable when upgrading its on-disk format.
-        if let Ok(mut old) = std::fs::File::open(path) {
-            use std::io::Read;
-            let mut header = [0; 9];
-            if old.read_exact(&mut header).is_ok() && &header[..8] == b"SURFDUST" && header[8] < 3 {
-                let mut backup = path.as_os_str().to_os_string();
-                backup.push(format!(".v{}.bak", header[8]));
-                if !std::path::Path::new(&backup).exists() {
-                    std::fs::copy(path, backup)?;
-                }
-            }
-        }
-        let mut bytes = Vec::with_capacity(self.cells.len() * 10 + 64 + self.actors.len() * 200);
+        Self::write_save(&self.save_bytes(), path)
+    }
+    /// Capture the exact ordered simulation state without touching the filesystem.
+    pub(crate) fn save_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(
+            self.cells.len() * 10
+                + 64
+                + self.actors.len() * 200
+                + self.air.nodes.len() * 12
+                + self.bodies.len() * 32,
+        );
         bytes.extend_from_slice(b"SURFDUST\x03");
         bytes.extend_from_slice(&(self.width as u32).to_le_bytes());
         bytes.extend_from_slice(&(self.height as u32).to_le_bytes());
@@ -541,10 +537,30 @@ impl World {
             bytes.extend_from_slice(&motion.vx.to_le_bytes());
             bytes.extend_from_slice(&motion.vy.to_le_bytes());
         }
+        bytes
+    }
+    pub(crate) fn write_save(
+        bytes: &[u8],
+        path: impl AsRef<std::path::Path>,
+    ) -> std::io::Result<()> {
+        use std::io::Write;
+        let path = path.as_ref();
+        // Keep the last legacy scene recoverable when upgrading its on-disk format.
+        if let Ok(mut old) = std::fs::File::open(path) {
+            use std::io::Read;
+            let mut header = [0; 9];
+            if old.read_exact(&mut header).is_ok() && &header[..8] == b"SURFDUST" && header[8] < 3 {
+                let mut backup = path.as_os_str().to_os_string();
+                backup.push(format!(".v{}.bak", header[8]));
+                if !std::path::Path::new(&backup).exists() {
+                    std::fs::copy(path, backup)?;
+                }
+            }
+        }
         let mut tmp = path.as_os_str().to_os_string();
         tmp.push(".tmp");
         let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(&bytes)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         std::fs::rename(&tmp, path)
     }

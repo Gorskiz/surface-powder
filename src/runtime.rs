@@ -1,6 +1,6 @@
 //! Ordered simulation on a worker; presentation never waits for a physics update.
 use crate::sim::{Input, World};
-use crate::{pour_world, save_world, Stroke};
+use crate::{persistence::SaveWriter, pour_world, Stroke};
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex, TryLockError};
 use std::thread::{self, JoinHandle};
@@ -31,6 +31,48 @@ fn thread_usage() -> Option<ThreadUsage> {
 #[cfg(not(target_os = "linux"))]
 fn thread_usage() -> Option<ThreadUsage> {
     None
+}
+
+/// Opt-in, lowest-priority round-robin scheduling for this worker only. The
+/// launcher must explicitly grant RLIMIT_RTPRIO=1; the executable gains no caps.
+/// Create other threads before calling this so they keep normal scheduling.
+fn configure_physics_scheduling() {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("SURFACE_POWDER_REALTIME").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        let param = sdl2::libc::sched_param { sched_priority: 1 };
+        let policy = sdl2::libc::SCHED_RR | sdl2::libc::SCHED_RESET_ON_FORK;
+        if unsafe { sdl2::libc::sched_setscheduler(0, policy, &param) } == 0 {
+            eprintln!("powder: physics scheduling=round-robin priority=1 reset-on-fork");
+        } else {
+            eprintln!(
+                "powder: physics scheduling remains normal: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+#[derive(Default)]
+struct TickTotals {
+    count: u64,
+    work: Duration,
+    max_work: Duration,
+    max_wake: Duration,
+    max_completion: Duration,
+    missed: u64,
+    work_late: u64,
+}
+impl TickTotals {
+    fn record(&mut self, work: Duration, wake: Duration, interval: Duration) {
+        let completion = wake + work;
+        self.count += 1;
+        self.work += work;
+        self.max_work = self.max_work.max(work);
+        self.max_wake = self.max_wake.max(wake);
+        self.max_completion = self.max_completion.max(completion);
+        self.missed += u64::from(completion > interval);
+        self.work_late += u64::from(work > interval);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -87,6 +129,8 @@ impl Runtime {
         let thread = thread::Builder::new()
             .name("powder-physics".into())
             .spawn(move || {
+                let saves = SaveWriter::start(notify.clone());
+                configure_physics_scheduling();
                 world.prepare();
                 let interval = Duration::from_nanos(16_666_667);
                 let mut next = Instant::now() + interval;
@@ -99,6 +143,9 @@ impl Runtime {
                 let mut dirty = false;
                 let mut updates = 0u64;
                 let mut timings = Vec::with_capacity(240);
+                let mut completions = Vec::with_capacity(240);
+                let mut max_wake = Duration::ZERO;
+                let mut totals = TickTotals::default();
                 let mut cpu_times = Vec::with_capacity(240);
                 let mut max_wait = Duration::ZERO;
                 let mut preemptions = 0;
@@ -123,16 +170,14 @@ impl Runtime {
                                 radius = r;
                             }
                             Command::Save(path, success) => {
-                                let notice = save_world(&world, &path);
-                                if success || notice == "SAVE FAILED" {
-                                    let _ = notify.send(notice);
-                                }
+                                saves.queue(path, world.save_bytes(), success);
                             }
                             Command::Stop => break 'run,
                         }
                     }
                     let now = Instant::now();
                     if !paused && now >= next {
+                        let scheduled = next;
                         let usage = if stress.is_some() { thread_usage() } else { None };
                         if updates == 0 { batch_start = Instant::now(); }
                         let measured = stress.is_some().then(Instant::now);
@@ -152,6 +197,11 @@ impl Runtime {
                         updates += 1;
                         if let Some(start) = measured {
                             let elapsed = start.elapsed();
+                            let wake = start.saturating_duration_since(scheduled);
+                            let completion = wake + elapsed;
+                            totals.record(elapsed, wake, interval);
+                            completions.push(completion);
+                            max_wake = max_wake.max(wake);
                             if let (Some(before), Some(after)) = (usage, thread_usage()) {
                                 let cpu = after.cpu.saturating_sub(before.cpu);
                                 let wait = elapsed.saturating_sub(cpu);
@@ -161,8 +211,9 @@ impl Runtime {
                                 minor_faults += after.minor_faults - before.minor_faults;
                                 major_faults += after.major_faults - before.major_faults;
                                 if elapsed > interval {
-                                    eprintln!("powder: slow update wall={:.3}ms cpu={:.3}ms waiting={:.3}ms preemptions={} faults={}/{}",
+                                    eprintln!("powder: slow update wall={:.3}ms cpu={:.3}ms waiting={:.3}ms wake={:.3}ms completion={:.3}ms preemptions={} faults={}/{}",
                                         elapsed.as_secs_f64()*1000., cpu.as_secs_f64()*1000., wait.as_secs_f64()*1000.,
+                                        wake.as_secs_f64()*1000., completion.as_secs_f64()*1000.,
                                         after.preemptions-before.preemptions, after.minor_faults-before.minor_faults, after.major_faults-before.major_faults);
                                 }
                             }
@@ -175,6 +226,12 @@ impl Runtime {
                                     timings.iter().map(|&d| ms(d)).sum::<f64>() / 240.,
                                     ms(timings[228]), ms(timings[239]),
                                     timings.iter().filter(|&&d| d > interval).count());
+                                completions.sort_unstable();
+                                eprintln!("powder: physics deadline completion p95={:.3}ms max={:.3}ms wake_max={:.3}ms missed={}/240",
+                                    ms(completions[228]), ms(completions[239]), ms(max_wake),
+                                    completions.iter().filter(|&&d| d > interval).count());
+                                completions.clear();
+                                max_wake = Duration::ZERO;
                                 if !cpu_times.is_empty() {
                                     cpu_times.sort_unstable();
                                     eprintln!("powder: stress CPU mean={:.3}ms p95={:.3}ms max={:.3}ms waiting_max={:.3}ms preemptions={} faults={}/{}",
@@ -218,6 +275,17 @@ impl Runtime {
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 }
+                // Include the final partial batch; a deadline miss must never be
+                // hidden by ending a diagnostic run before its next 240-tick report.
+                if totals.count != 0 {
+                    let ms = |d: Duration| d.as_secs_f64() * 1000.;
+                    eprintln!("powder: physics totals updates={} work_mean={:.3}ms work_max={:.3}ms completion_max={:.3}ms wake_max={:.3}ms missed={} work_late={}",
+                        totals.count, ms(totals.work) / totals.count as f64, ms(totals.max_work),
+                        ms(totals.max_completion), ms(totals.max_wake), totals.missed, totals.work_late);
+                }
+                // Finish every accepted write before returning the final world.
+                // The main thread's final save can then safely replace the same slot.
+                drop(saves);
                 world
             })
             .expect("Could not start simulation worker");
@@ -286,6 +354,17 @@ mod tests {
     use super::*;
     use crate::sim::Material;
     #[test]
+    fn deadline_totals_count_late_wakeups_even_when_work_is_under_budget() {
+        let mut totals = TickTotals::default();
+        let interval = Duration::from_millis(16);
+        totals.record(Duration::from_millis(8), Duration::from_millis(9), interval);
+        totals.record(Duration::from_millis(8), Duration::from_millis(8), interval);
+        assert_eq!(totals.count, 2);
+        assert_eq!(totals.missed, 1);
+        assert_eq!(totals.work_late, 0);
+        assert_eq!(totals.max_completion, Duration::from_millis(17));
+    }
+    #[test]
     fn startup_waits_for_controls_without_advancing_physics() {
         let mut initial = World::new(32, 32);
         initial.paint_line(10, 4, 10, 4, 0, Material::Sand);
@@ -350,6 +429,50 @@ mod tests {
         assert_ne!(notice, "SAVE FAILED");
         assert_eq!(World::load(&path).unwrap().at(8, 8), Material::Wall);
         runtime.finish().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn blocked_save_io_keeps_simulation_commands_running_and_preserves_the_save_point() {
+        use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::env::temp_dir().join(format!("powder-blocked-save-{}", std::process::id()));
+        let fifo = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { sdl2::libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let (release, wait) = mpsc::channel();
+        let reader_path = path.clone();
+        let unblock = std::thread::spawn(move || {
+            wait.recv().unwrap();
+            // The background writer blocks opening the old slot until this peer
+            // opens the FIFO. Its invalid legacy header is then safely replaced.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(reader_path)
+                .unwrap()
+                .write_all(b"not-a-save")
+                .unwrap();
+        });
+        let mut initial = World::new(32, 32);
+        initial.paint_line(8, 8, 8, 8, 0, Material::Wall);
+        let runtime = Runtime::start(initial, None);
+        runtime.save(path.clone(), true).unwrap();
+        let (progress, receive) = mpsc::channel();
+        runtime
+            .edit(move |w| {
+                w.paint_line(8, 8, 8, 8, 0, Material::Empty);
+                progress.send(()).unwrap();
+            })
+            .unwrap();
+        let advanced = receive.recv_timeout(Duration::from_secs(3));
+        let premature_notice = runtime.notice();
+        // Release before asserting, so even a regression cannot deadlock cleanup.
+        release.send(()).unwrap();
+        unblock.join().unwrap();
+        let final_world = runtime.finish().unwrap();
+        assert!(advanced.is_ok());
+        assert!(premature_notice.is_none());
+        assert_eq!(final_world.at(8, 8), Material::Empty);
+        assert_eq!(World::load(&path).unwrap().at(8, 8), Material::Wall);
         std::fs::remove_file(path).unwrap();
     }
 }
