@@ -167,8 +167,8 @@ residual values and can change random-state hashes of older scenes.
 
 `--benchmark` measures the starter scene. `--benchmark-stress` measures a dense
 powder/water scene and separate nitro/C4 chains. `--benchmark-dense` measures a
-full 120,000-cell water scene and water with 2,500 nitro charges injected every
-60 updates. It reports mean, 95th-percentile and maximum update times, stage
+full 120,000-cell water scene and water with either 2,500 central nitro charges
+or 32,000 distributed charges injected every 60 updates. It reports mean, 95th-percentile and maximum update times, stage
 breakdowns, rendering time and state/trajectory digests. All benchmarks exclude
 SDL presentation and UI drawing; setup is outside timed updates.
 
@@ -186,42 +186,64 @@ Drawing, object creation and saves remain ordered on the worker; shutdown waits
 for pending edits before saving the actual simulation. `--profile-frames` logs
 presentation frame intervals, including SDL work and frame pacing.
 
-For an interactive sustained stress test:
+Before animation starts, the game prepares collision/air caches, writable
+simulation pages, explosion stencils, textures and the Wayland presentation
+queue. Physics waits for the first controls after this preparation. Resuming
+from pause starts a fresh 60 Hz cadence without catch-up ticks. Preparation is
+tested against complete saves and subsequent updates to preserve state exactly.
+
+On Linux desktops with power-profiles-daemon, use the optional launcher:
 
 ```sh
-cargo run --release --locked -- --stress-dense --frames 3600 --profile-frames
+cargo build --release --locked
+./scripts/run-game.sh
 ```
 
-This starts with 120,000 water cells, injects 2,500 nitro charges every 60 physics
-updates, and refills empty cells at each burst to sustain density. It reports
-physics rate and update times independently of display frame intervals. It does
-not load or overwrite the player's saved scene. Glyph pixels are submitted in
-batches; glow decay keeps its original elapsed-time cadence at the higher FPS.
+It requests a performance profile only while the game runs, then releases it.
+It respects an already selected power-saver profile. A user or thermal/battery
+policy can cancel the hold; the launcher does not reacquire it. The native
+binary itself does not change power settings. This uses the daemon's standard
+[process-lifetime profile hold](https://upower.pages.freedesktop.org/power-profiles-daemon/gdbus-org.freedesktop.UPower.PowerProfiles.html).
 
-Measured on the Debian Surface Pro 4 with Wayland/OpenGL and the **balanced**
-power profile: the live test sustained approximately 60 display FPS and 60
-physics updates per second over 3,600 displayed frames. Physics averaged 7.68 ms
-across 3,360 reported updates. Display intervals averaged 16.63 ms; after the
-first 150 frames, the worst interval was 24.46 ms. One startup interval took
-57.26 ms. Twenty-one physics updates exceeded 16.67 ms (maximum 33.96 ms), while
-the worker recovered its 60 Hz rate and presentation remained independent.
+For sustained interactive stress tests:
 
-The power profile is decisive: power-saver held the plugged-in CPU around
-900 MHz under load. A two-run comparison with both binaries in balanced mode
-measured 7.00 ms per water/explosion update for the previous binary and 6.44 ms
-for this version,
-with identical state and trajectory hashes. The earlier measurement was
-18.92 ms under power-saver. Most of the Surface improvement comes from allowing
-the CPU to run normally and removing the old 30 FPS presentation cap. The game does not
-change system power profiles or disable thermal/battery protection.
+```sh
+./scripts/run-game.sh --stress-dense --frames 3600 --profile-frames
+./scripts/run-game.sh --stress-extreme --frames 7200 --profile-frames
+```
 
-Full-water and repeated-explosion state/trajectory digests match the previous
-binary exactly. Existing legacy scenes can still differ because of the
-subnormal cleanup described above. Resolution, particle capacity, impulses,
-material rules and random draw order are retained. Chain reactions keep the
-existing 64-detonation-per-update budget and save pending detonations. These
-measurements demonstrate a sustained workload, not a guarantee against all OS
-scheduling stalls, thermal limits or arbitrary scenes.
+Both start with 120,000 water cells and refill empty cells at each burst. Dense
+injects 2,500 nitro charges every 60 physics updates; extreme injects 32,000 in
+64 patches across the screen. The existing 64-detonation-per-update budget is
+unchanged. Neither test loads or overwrites the player's save. Live tick timings
+include refilling and injecting the test bursts. Linux diagnostics distinguish
+thread CPU time from elapsed time, preemptions and page faults; startup timings
+are reported separately from animated frames.
+
+The remaining spikes on the Surface came from brief CPU clock drops even in
+balanced mode. A game-only performance hold removed them without changing
+material rules, forces, particle capacity, resolution or random draw order.
+The kiosk releases the hold on switching to Home Assistant. Its heat and battery
+guardian can still cancel the hold.
+
+Measured on the Debian Surface Pro 4, Wayland/OpenGL, with that hold active:
+
+| Live workload | Displayed frames | Mean tick | Worst tick | Updates over 16.67 ms | Worst frame interval |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 2,500-charge bursts | 3,600 | 7.02 ms | 13.60 ms | 0 / 3,360 reported | 19.15 ms |
+| 32,000-charge distributed bursts | 7,200 | 4.79 ms | 12.15 ms | 0 / 6,960 reported | 19.71 ms |
+
+Both maintained approximately 60 display FPS and 60 physics updates per second,
+with no frame intervals over 25 ms. Preparation took about 185–188 ms in the
+native process; the first animated frame took 16.5–16.6 ms. This moves cold
+Wayland initialization before animation; it does not make process startup
+instantaneous. More charges can be cheaper per update because pending charges
+wait under the same existing detonation budget.
+
+Full-water and repeated-explosion state/trajectory digests still match the
+previous binary exactly. The earlier subnormal cleanup can still affect legacy
+saves as described above. Measurements cover these sustained workloads; they do
+not guarantee deadlines under arbitrary OS load, power saving or thermal limits.
 
 ![Full-screen water and repeated explosions during the Surface 60 FPS stress test](docs/screenshots/dense-explosions.png)
 

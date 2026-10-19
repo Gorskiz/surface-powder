@@ -356,6 +356,10 @@ fn make_blast_stencil(radius: i32) -> Vec<BlastPoint> {
     }
     points
 }
+fn standard_blast_stencil() -> &'static [BlastPoint] {
+    static STENCIL: std::sync::OnceLock<Vec<BlastPoint>> = std::sync::OnceLock::new();
+    STENCIL.get_or_init(|| make_blast_stencil(10))
+}
 fn permanent_barrier(m: Material) -> bool {
     matches!(m, Material::Wall | Material::Metal | Material::Clone)
 }
@@ -1031,10 +1035,9 @@ impl World {
             },
             radius,
         );
-        static STENCIL: std::sync::OnceLock<Vec<BlastPoint>> = std::sync::OnceLock::new();
         let fallback;
         let points = if r == 10 {
-            STENCIL.get_or_init(|| make_blast_stencil(10)).as_slice()
+            standard_blast_stencil()
         } else {
             fallback = make_blast_stencil(r);
             &fallback
@@ -1305,6 +1308,32 @@ impl World {
             y = ty;
         }
         (i, x, y)
+    }
+    /// Populate caches and touch writable pages before the first animated frame.
+    /// Values, random state, and update ordering remain unchanged.
+    pub fn prepare(&mut self) {
+        let _ = standard_blast_stencil();
+        for v in self
+            .motion
+            .iter_mut()
+            .step_by(4096 / std::mem::size_of::<Motion>())
+        {
+            *v = std::hint::black_box(*v);
+        }
+        for v in self
+            .visited
+            .iter_mut()
+            .step_by(4096 / std::mem::size_of::<u32>())
+        {
+            *v = std::hint::black_box(*v);
+        }
+        if let Some(v) = self.motion.last_mut() {
+            *v = std::hint::black_box(*v);
+        }
+        if let Some(v) = self.visited.last_mut() {
+            *v = std::hint::black_box(*v);
+        }
+        self.air.prepare(self.width, self.height, &self.cells);
     }
     pub fn step(&mut self, input: Input) {
         self.advance::<false>(input);
@@ -2077,6 +2106,33 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn startup_preparation_preserves_state_and_future_physics() {
+        let make = || {
+            let mut w = World::new(80, 64);
+            w.seed_demo();
+            w.air.add_wind(30., 25., 4., -2., 15.);
+            w
+        };
+        let mut prepared = make();
+        let mut reference = make();
+        let p = std::env::temp_dir().join(format!("powder-prepare-{}", std::process::id()));
+        prepared.save(&p).unwrap();
+        let before = std::fs::read(&p).unwrap();
+        prepared.prepare();
+        prepared.prepare();
+        prepared.save(&p).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+        for _ in 0..120 {
+            prepared.step(Input::default());
+            reference.step(Input::default());
+        }
+        prepared.save(&p).unwrap();
+        let after = std::fs::read(&p).unwrap();
+        reference.save(&p).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), after);
+        std::fs::remove_file(p).unwrap();
+    }
     #[test]
     fn dense_fast_paths_preserve_complete_state_through_wind_blasts_and_edits() {
         for scene in 0..3 {

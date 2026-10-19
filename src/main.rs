@@ -238,7 +238,7 @@ impl App {
     fn change_page(&mut self, delta: isize) {
         self.page = (self.page as isize + delta).rem_euclid(page_count() as isize) as usize;
     }
-    fn threaded(world: World, stress: bool) -> Result<Self, String> {
+    fn threaded(world: World, stress: Option<runtime::Stress>) -> Result<Self, String> {
         let mut visual = World::new(world.width, world.height);
         let runtime = runtime::Runtime::start(world, stress);
         runtime.copy_latest(&mut visual)?;
@@ -598,7 +598,18 @@ fn draw(
     }
     Ok(())
 }
+fn upload_pixels(texture: &mut sdl2::render::Texture, pixels: &[u32]) -> Result<(), String> {
+    texture.with_lock(None, |buf, pitch| {
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                let offset = y * pitch + x * 4;
+                buf[offset..offset + 4].copy_from_slice(&pixels[y * WIDTH + x].to_ne_bytes());
+            }
+        }
+    })
+}
 fn main() -> Result<(), String> {
+    let launched = Instant::now();
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|s| s == "--benchmark-dense") {
         return benchmark_dense(
@@ -613,6 +624,7 @@ fn main() -> Result<(), String> {
     if args.iter().any(|s| s == "--benchmark") {
         return benchmark();
     }
+    let profile_frames = args.iter().any(|s| s == "--profile-frames");
     // Install termination handler so a hardware-button switch saves the scene.
     unsafe {
         sdl2::libc::signal(sdl2::libc::SIGTERM, terminate as *const () as usize);
@@ -649,14 +661,20 @@ fn main() -> Result<(), String> {
     let mut texture = creator
         .create_texture_streaming(PixelFormatEnum::RGB888, WIDTH as u32, HEIGHT as u32)
         .map_err(|e| e.to_string())?;
-    let stress = args.iter().any(|s| s == "--stress-dense");
+    let stress = if args.iter().any(|s| s == "--stress-extreme") {
+        Some(runtime::Stress::Extreme)
+    } else if args.iter().any(|s| s == "--stress-dense") {
+        Some(runtime::Stress::Dense)
+    } else {
+        None
+    };
     // Diagnostic scenes never overwrite a player's save, including manual saves.
-    let path = if stress {
+    let path = if stress.is_some() {
         std::env::temp_dir().join(format!("powder-stress-{}.bin", std::process::id()))
     } else {
         state_path()
     };
-    let world = if stress {
+    let world = if stress.is_some() {
         dense_water()
     } else {
         match World::load(&path) {
@@ -685,13 +703,54 @@ fn main() -> Result<(), String> {
         .iter()
         .position(|s| s == "--screenshot")
         .and_then(|i| args.get(i + 1));
-    let profile_frames = args.iter().any(|s| s == "--profile-frames");
     let mut frame_times = Vec::new();
-    let mut previous_frame = Instant::now();
+    let mut previous_frame;
     let trail_interval = Duration::from_nanos(33_333_333);
-    let mut next_trail = Instant::now() + trail_interval;
-    let mut next_frame = Instant::now();
-    let mut counts = 0;
+    let mut next_trail;
+    let mut next_frame;
+    let mut counts = app
+        .world
+        .cells
+        .iter()
+        .filter(|c| c.material != Material::Empty)
+        .count();
+    if profile_frames {
+        eprintln!(
+            "powder: startup initialized={:.3}ms",
+            launched.elapsed().as_secs_f64() * 1000.
+        );
+    }
+    // Load the texture, shaders and Wayland frame queue before any physics advances.
+    let startup_notice = std::mem::replace(&mut app.notice, "STARTING".into());
+    app.world.render(&mut pixels);
+    trails.copy_from_slice(&pixels);
+    upload_pixels(&mut texture, &pixels)?;
+    for pass in 1..=4 {
+        if QUIT.load(Ordering::Relaxed) {
+            break;
+        }
+        let warm = Instant::now();
+        draw(&app, &mut c, &texture, &controls(app.page), counts)?;
+        c.present();
+        if profile_frames {
+            eprintln!(
+                "powder: startup prepare frame={} time={:.3}ms launch={:.3}ms",
+                pass,
+                warm.elapsed().as_secs_f64() * 1000.,
+                launched.elapsed().as_secs_f64() * 1000.
+            );
+        }
+    }
+    app.notice = startup_notice;
+    previous_frame = Instant::now();
+    next_frame = previous_frame;
+    next_trail = previous_frame + trail_interval;
+    if profile_frames {
+        eprintln!(
+            "powder: startup ready={:.3}ms; physics begins with first controls",
+            launched.elapsed().as_secs_f64() * 1000.
+        );
+    }
     eprintln!("powder: scene loaded; entering main loop");
     'running: while !QUIT.load(Ordering::Relaxed) {
         let frame = Instant::now();
@@ -804,6 +863,8 @@ fn main() -> Result<(), String> {
                 app.notify(notice);
             }
         }
+        let tracing_startup = profile_frames && frames < 5;
+        let rendering = tracing_startup.then(Instant::now);
         app.world.render(&mut pixels);
         let now = Instant::now();
         let fade_trail = now >= next_trail;
@@ -828,14 +889,8 @@ fn main() -> Result<(), String> {
             }
             *t = *p;
         }
-        texture.with_lock(None, |buf, pitch| {
-            for y in 0..HEIGHT {
-                for x in 0..WIDTH {
-                    let offset = y * pitch + x * 4;
-                    buf[offset..offset + 4].copy_from_slice(&pixels[y * WIDTH + x].to_ne_bytes());
-                }
-            }
-        })?;
+        let rendered = tracing_startup.then(Instant::now);
+        upload_pixels(&mut texture, &pixels)?;
         if frames % 60 == 0 {
             counts = app
                 .world
@@ -847,7 +902,9 @@ fn main() -> Result<(), String> {
         if app.clear_until.is_some_and(|t| t < Instant::now()) {
             app.clear_until = None;
         }
+        let uploaded = tracing_startup.then(Instant::now);
         draw(&app, &mut c, &texture, &controls(app.page), counts)?;
+        let drawn = tracing_startup.then(Instant::now);
         frames += 1;
         let finishing = max_frames.is_some_and(|n| frames >= n);
         if CAPTURE.swap(false, Ordering::Relaxed) || (finishing && screenshot.is_some()) {
@@ -866,10 +923,15 @@ fn main() -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
         }
         c.present();
+        if tracing_startup {
+            eprintln!("powder: startup frame={} render={:.3}ms upload={:.3}ms UI={:.3}ms present={:.3}ms total={:.3}ms launch={:.3}ms",
+                frames, (rendered.unwrap()-rendering.unwrap()).as_secs_f64()*1000., (uploaded.unwrap()-rendered.unwrap()).as_secs_f64()*1000.,
+                (drawn.unwrap()-uploaded.unwrap()).as_secs_f64()*1000., drawn.unwrap().elapsed().as_secs_f64()*1000., frame.elapsed().as_secs_f64()*1000., launched.elapsed().as_secs_f64()*1000.);
+        }
         if finishing {
             break;
         }
-        if !stress && last_save.elapsed() > Duration::from_secs(30) {
+        if stress.is_none() && last_save.elapsed() > Duration::from_secs(30) {
             app.request_save(&path, false);
             last_save = Instant::now();
         }
@@ -890,7 +952,7 @@ fn main() -> Result<(), String> {
     } else {
         app.world
     };
-    if !stress {
+    if stress.is_none() {
         let result = save_world(&world, &path);
         if result == "SAVE FAILED" {
             return Err(result);
@@ -954,7 +1016,12 @@ fn inject_dense_explosion(world: &mut World) {
 /// Stage timings plus an exact serialized-state digest allow before/after comparisons.
 fn benchmark_dense(saved_world: Option<&String>) -> Result<(), String> {
     use std::hash::{Hash, Hasher};
-    for scene in ["full-water", "water-explosions", "saved-scene"] {
+    for scene in [
+        "full-water",
+        "water-explosions",
+        "water-megablasts",
+        "saved-scene",
+    ] {
         if scene == "saved-scene" && saved_world.is_none() {
             continue;
         }
@@ -962,8 +1029,10 @@ fn benchmark_dense(saved_world: Option<&String>) -> Result<(), String> {
             World::load(saved_world.unwrap()).map_err(|e| e.to_string())?
         } else {
             let mut w = dense_water();
-            if scene == "water-explosions" {
-                inject_dense_explosion(&mut w);
+            match scene {
+                "water-explosions" => runtime::Stress::Dense.inject(&mut w),
+                "water-megablasts" => runtime::Stress::Extreme.inject(&mut w),
+                _ => {}
             }
             w
         };
@@ -973,8 +1042,12 @@ fn benchmark_dense(saved_world: Option<&String>) -> Result<(), String> {
         let mut render = Duration::ZERO;
         let mut trajectory = std::collections::hash_map::DefaultHasher::new();
         for tick in 0..240 {
-            if scene == "water-explosions" && tick != 0 && tick % 60 == 0 {
-                inject_dense_explosion(&mut world);
+            if tick != 0 && tick % 60 == 0 {
+                match scene {
+                    "water-explosions" => runtime::Stress::Dense.inject(&mut world),
+                    "water-megablasts" => runtime::Stress::Extreme.inject(&mut world),
+                    _ => {}
+                }
             }
             let start = Instant::now();
             let parts = world.step_profiled(Input::default());
@@ -1078,7 +1151,7 @@ mod tests {
     use super::*;
     #[test]
     fn threaded_gestures_and_payload_survive_immediate_shutdown() {
-        let mut app = App::threaded(World::new(WIDTH, HEIGHT), false).unwrap();
+        let mut app = App::threaded(World::new(WIDTH, HEIGHT), None).unwrap();
         app.runtime
             .as_ref()
             .unwrap()

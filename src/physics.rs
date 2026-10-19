@@ -162,6 +162,19 @@ impl Air {
         }
         (vx, vy)
     }
+    pub fn prepare(&mut self, width: usize, height: usize, cells: &[Cell]) {
+        self.rebuild_obstacles(width, height, cells);
+        for v in self
+            .scratch
+            .iter_mut()
+            .step_by(4096 / std::mem::size_of::<AirCell>())
+        {
+            *v = std::hint::black_box(*v);
+        }
+        if let Some(v) = self.scratch.last_mut() {
+            *v = std::hint::black_box(*v);
+        }
+    }
     fn rebuild_obstacles(&mut self, width: usize, height: usize, cells: &[Cell]) {
         let mut changed = !self.obstacles_valid || self.obstacle_pixels.len() != cells.len();
         self.obstacle_pixels.resize(cells.len(), false);
