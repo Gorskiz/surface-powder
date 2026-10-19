@@ -1,5 +1,6 @@
 mod font;
 mod physics;
+mod runtime;
 mod sim;
 
 use sdl2::{
@@ -188,6 +189,7 @@ struct App {
     secondary: Material,
     select_secondary: bool,
     negative_pressure: bool,
+    runtime: Option<runtime::Runtime>,
     page: usize,
     radius: i32,
     paused: bool,
@@ -212,6 +214,7 @@ impl App {
             secondary: Material::Empty,
             select_secondary: false,
             negative_pressure: false,
+            runtime: None,
             page: 0,
             radius: 3,
             paused: false,
@@ -233,24 +236,41 @@ impl App {
     fn change_page(&mut self, delta: isize) {
         self.page = (self.page as isize + delta).rem_euclid(page_count() as isize) as usize;
     }
-    fn pour(&mut self, stroke: Stroke) {
-        let p = stroke.last;
-        match stroke.material {
-            Material::Air => self
-                .world
-                .apply_pressure(p.0, p.1, self.radius * 3, stroke.pressure),
-            Material::Wind => self.world.paint_line(
-                p.0,
-                p.1,
-                p.0 + stroke.direction.0,
-                p.1 + stroke.direction.1,
-                self.radius,
-                Material::Wind,
-            ),
-            Material::Drag => {}
-            m if one_shot(m) => {}
-            m => self.world.paint_line(p.0, p.1, p.0, p.1, self.radius, m),
+    fn threaded(world: World) -> Result<Self, String> {
+        let mut visual = World::new(world.width, world.height);
+        let runtime = runtime::Runtime::start(world);
+        runtime.copy_latest(&mut visual)?;
+        let mut app = Self::new(visual);
+        app.runtime = Some(runtime);
+        Ok(app)
+    }
+    fn edit_world(&mut self, edit: impl FnOnce(&mut World) + Send + 'static) {
+        if let Some(runtime) = &self.runtime {
+            if let Err(error) = runtime.edit(edit) {
+                self.notify(error);
+            }
+        } else {
+            edit(&mut self.world);
         }
+    }
+    fn request_save(&mut self, path: &PathBuf, manual: bool) {
+        if let Some(runtime) = &self.runtime {
+            let result = runtime.save(path.clone(), manual);
+            if let Err(error) = result {
+                self.notify(error);
+            } else if manual {
+                self.notify("SAVING".into());
+            }
+        } else {
+            let result = save_world(&self.world, path);
+            if manual || result == "SAVE FAILED" {
+                self.notify(result);
+            }
+        }
+    }
+    fn pour(&mut self, stroke: Stroke) {
+        let radius = self.radius;
+        self.edit_world(move |world| pour_world(world, stroke, radius));
     }
     fn press(&mut self, id: i64, x: i32, y: i32, buttons: &[(Rect, Action)], path: &PathBuf) {
         self.clear_until = self.clear_until.filter(|t| *t > Instant::now());
@@ -271,7 +291,7 @@ impl App {
                         } else if (self.erasing || self.select_secondary) && m.is_cell() {
                             self.secondary = m;
                             if m != Material::Empty {
-                                self.world.brush_payload = m;
+                                self.edit_world(move |world| world.brush_payload = m);
                             }
                             self.select_secondary = false;
                             self.notify(format!("SECONDARY: {}", m.name()));
@@ -292,16 +312,15 @@ impl App {
                     Action::PreviousPage => self.change_page(-1),
                     Action::NextPage => self.change_page(1),
                     Action::Demo => {
-                        self.world.seed_demo();
+                        self.edit_world(World::seed_demo);
                         self.notify("DEMO LOADED".into());
                     }
                     Action::Save => {
-                        let s = save_world(&self.world, path);
-                        self.notify(s);
+                        self.request_save(path, true);
                     }
                     Action::Clear => {
                         if self.clear_until.is_some() {
-                            self.world.clear();
+                            self.edit_world(World::clear);
                             self.clear_until = None;
                         } else {
                             self.clear_until = Some(Instant::now() + Duration::from_secs(3));
@@ -325,18 +344,12 @@ impl App {
             };
             let stroke = Stroke::new(m, p, self.erasing || self.negative_pressure);
             if one_shot(m) && m != Material::Bubble {
-                self.world.paint_line(
-                    p.0,
-                    p.1,
-                    p.0,
-                    p.1,
-                    if m.is_object() {
-                        self.radius + 5
-                    } else {
-                        self.radius
-                    },
-                    m,
-                );
+                let radius = if m.is_object() {
+                    self.radius + 5
+                } else {
+                    self.radius
+                };
+                self.edit_world(move |world| world.paint_line(p.0, p.1, p.0, p.1, radius, m));
             } else if m != Material::Bubble {
                 self.pour(stroke);
             }
@@ -345,7 +358,7 @@ impl App {
     }
     fn drag(&mut self, id: i64, x: i32, y: i32) {
         if let Some(p) = grid(x, y) {
-            if let Some(stroke) = self.pointers.get_mut(&id) {
+            if let Some(mut stroke) = self.pointers.get(&id).copied() {
                 let prev = stroke.last;
                 let dx = p.0 - prev.0;
                 let dy = p.1 - prev.1;
@@ -354,22 +367,21 @@ impl App {
                 if dx != 0 || dy != 0 {
                     stroke.direction = (dx.clamp(-12, 12), dy.clamp(-12, 12));
                 }
+                let radius = self.radius;
                 match stroke.material {
                     Material::Drag => {
-                        self.world
-                            .drag_at(prev.0, prev.1, dx, dy, self.radius * 2 + 5)
+                        self.edit_world(move |w| w.drag_at(prev.0, prev.1, dx, dy, radius * 2 + 5))
                     }
-                    Material::Air => {
-                        self.world
-                            .apply_pressure(p.0, p.1, self.radius * 3, stroke.pressure)
-                    }
+                    Material::Air => self.edit_world(move |w| {
+                        w.apply_pressure(p.0, p.1, radius * 3, stroke.pressure)
+                    }),
                     m if !one_shot(m) => {
-                        self.world
-                            .paint_line(prev.0, prev.1, p.0, p.1, self.radius, m)
+                        self.edit_world(move |w| w.paint_line(prev.0, prev.1, p.0, p.1, radius, m))
                     }
                     _ => {}
                 }
                 stroke.last = p;
+                self.pointers.insert(id, stroke);
             }
         }
     }
@@ -377,10 +389,27 @@ impl App {
         if let Some(stroke) = self.pointers.remove(&id) {
             if stroke.material == Material::Bubble {
                 let (x, y, r) = stroke.circle(self.radius);
-                self.world.paint_line(x, y, x, y, r, Material::Bubble);
+                self.edit_world(move |w| w.paint_line(x, y, x, y, r, Material::Bubble));
             }
         }
         self.held.remove(&id);
+    }
+}
+fn pour_world(world: &mut World, stroke: Stroke, radius: i32) {
+    let p = stroke.last;
+    match stroke.material {
+        Material::Air => world.apply_pressure(p.0, p.1, radius * 3, stroke.pressure),
+        Material::Wind => world.paint_line(
+            p.0,
+            p.1,
+            p.0 + stroke.direction.0,
+            p.1 + stroke.direction.1,
+            radius,
+            Material::Wind,
+        ),
+        Material::Drag => {}
+        m if one_shot(m) => {}
+        m => world.paint_line(p.0, p.1, p.0, p.1, radius, m),
     }
 }
 fn grid(x: i32, y: i32) -> Option<(i32, i32)> {
@@ -569,6 +598,13 @@ fn draw(
 }
 fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|s| s == "--benchmark-dense") {
+        return benchmark_dense(
+            args.iter()
+                .position(|s| s == "--world")
+                .and_then(|i| args.get(i + 1)),
+        );
+    }
     if args.iter().any(|s| s == "--benchmark-stress") {
         return benchmark_stress();
     }
@@ -616,12 +652,11 @@ fn main() -> Result<(), String> {
         }
         Err(e) => return Err(format!("Save could not be loaded (preserved): {e}")),
     };
-    let mut app = App::new(world);
+    let mut app = App::threaded(world)?;
     let mut events = ctx.event_pump()?;
     let mut pixels = vec![0u32; WIDTH * HEIGHT];
     let mut trails = vec![0u32; WIDTH * HEIGHT];
     let mut last_save = Instant::now();
-    let mut last_step = Instant::now();
     let mut frames = 0u64;
     let max_frames = args
         .iter()
@@ -632,10 +667,20 @@ fn main() -> Result<(), String> {
         .iter()
         .position(|s| s == "--screenshot")
         .and_then(|i| args.get(i + 1));
+    let profile_frames = args.iter().any(|s| s == "--profile-frames");
+    let mut frame_times = Vec::new();
+    let mut previous_frame = Instant::now();
     let mut counts = 0;
     eprintln!("powder: scene loaded; entering main loop");
     'running: while !QUIT.load(Ordering::Relaxed) {
         let frame = Instant::now();
+        if profile_frames && frames > 0 {
+            frame_times.push(frame.duration_since(previous_frame));
+            if frame_times.len() == 150 {
+                report_frames(&mut frame_times);
+            }
+        }
+        previous_frame = frame;
         for e in events.poll_iter() {
             match e {
                 Event::Quit { .. } => break 'running,
@@ -722,28 +767,20 @@ fn main() -> Result<(), String> {
                 || keyboard.is_scancode_pressed(Scancode::W)
                 || app.held.values().any(|a| *a == Action::Jump),
         };
-        let step_time = Duration::from_nanos(16_666_667);
-        if app.paused {
-            last_step = frame;
-        } else {
-            // Target 60 Hz, but yield to input/rendering after 12 ms of simulation.
-            // Expensive scenes slow simulation time instead of stacking four slow ticks.
-            let simulation_started = Instant::now();
-            let mut steps = 0;
-            while frame.duration_since(last_step) >= step_time && steps < 2 {
-                let strokes: Vec<_> = app.pointers.values().copied().collect();
-                for stroke in strokes {
-                    app.pour(stroke);
-                }
-                app.world.step(input);
-                last_step += step_time;
-                steps += 1;
-                if simulation_started.elapsed() >= Duration::from_millis(12) {
-                    break;
-                }
+        if let Some(runtime) = &app.runtime {
+            runtime.controls(
+                input,
+                app.paused,
+                app.pointers.values().copied().collect(),
+                app.radius,
+            )?;
+            runtime.copy_latest(&mut app.world)?;
+            let mut notices = Vec::new();
+            while let Some(notice) = runtime.notice() {
+                notices.push(notice);
             }
-            if frame.duration_since(last_step) >= step_time {
-                last_step = frame;
+            for notice in notices {
+                app.notify(notice);
             }
         }
         app.world.render(&mut pixels);
@@ -800,19 +837,36 @@ fn main() -> Result<(), String> {
             break;
         }
         if last_save.elapsed() > Duration::from_secs(30) {
-            let result = save_world(&app.world, &path);
-            if result == "SAVE FAILED" {
-                app.notify(result);
-            }
+            app.request_save(&path, false);
             last_save = Instant::now();
         }
         std::thread::sleep(Duration::from_millis(33).saturating_sub(frame.elapsed()));
     }
-    let result = save_world(&app.world, &path);
+    if profile_frames && !frame_times.is_empty() {
+        report_frames(&mut frame_times);
+    }
+    let world = if let Some(runtime) = app.runtime.take() {
+        runtime.finish()?
+    } else {
+        app.world
+    };
+    let result = save_world(&world, &path);
     if result == "SAVE FAILED" {
         return Err(result);
     }
     Ok(())
+}
+fn report_frames(times: &mut Vec<Duration>) {
+    times.sort_unstable();
+    let ms = |d: Duration| d.as_secs_f64() * 1000.;
+    eprintln!(
+        "powder: frame interval mean={:.3}ms p95={:.3}ms max={:.3}ms ({} frames)",
+        times.iter().map(|&d| ms(d)).sum::<f64>() / times.len() as f64,
+        ms(times[times.len() * 95 / 100]),
+        ms(*times.last().unwrap()),
+        times.len()
+    );
+    times.clear();
 }
 fn benchmark() -> Result<(), String> {
     let mut world = World::new(WIDTH, HEIGHT);
@@ -829,6 +883,82 @@ fn benchmark() -> Result<(), String> {
         start.elapsed().as_secs_f64() * 1000. / 900.,
         std::mem::size_of_val(world.cells.as_slice())
     );
+    Ok(())
+}
+/// Stage timings plus an exact serialized-state digest allow before/after comparisons.
+fn benchmark_dense(saved_world: Option<&String>) -> Result<(), String> {
+    use std::hash::{Hash, Hasher};
+    for scene in ["full-water", "water-explosions", "saved-scene"] {
+        if scene == "saved-scene" && saved_world.is_none() {
+            continue;
+        }
+        let mut world = if scene == "saved-scene" {
+            World::load(saved_world.unwrap()).map_err(|e| e.to_string())?
+        } else {
+            let mut w = World::new(WIDTH, HEIGHT);
+            for y in 0..HEIGHT as i32 {
+                w.paint_line(0, y, WIDTH as i32 - 1, y, 0, Material::Water);
+            }
+            if scene == "water-explosions" {
+                for y in 125..175 {
+                    for x in 175..225 {
+                        w.cells[y * WIDTH + x] = sim::Cell::new(Material::Nitro);
+                    }
+                }
+                assert_eq!(
+                    w.cells
+                        .iter()
+                        .filter(|c| c.material == Material::Nitro)
+                        .count(),
+                    2500
+                );
+                w.apply_pressure(200, 150, 40, 10.);
+            }
+            w
+        };
+        let mut timings = Vec::new();
+        let mut stages = [Duration::ZERO; 4];
+        let mut pixels = vec![0; WIDTH * HEIGHT];
+        let mut render = Duration::ZERO;
+        let mut trajectory = std::collections::hash_map::DefaultHasher::new();
+        for tick in 0..240 {
+            if scene == "water-explosions" && tick != 0 && tick % 60 == 0 {
+                for y in 125..175 {
+                    for x in 175..225 {
+                        world.cells[y * WIDTH + x] = sim::Cell::new(Material::Nitro);
+                    }
+                }
+                world.apply_pressure(200, 150, 40, 10.);
+            }
+            let start = Instant::now();
+            let parts = world.step_profiled(Input::default());
+            timings.push(start.elapsed());
+            for (total, part) in stages.iter_mut().zip(parts) {
+                *total += part;
+            }
+            let start = Instant::now();
+            world.render(&mut pixels);
+            render += start.elapsed();
+            pixels.hash(&mut trajectory);
+        }
+        let path =
+            std::env::temp_dir().join(format!("powder-digest-{}-{scene}.bin", std::process::id()));
+        world.save(&path).map_err(|e| e.to_string())?;
+        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+        std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut hash);
+        let mut physical = std::collections::hash_map::DefaultHasher::new();
+        let air_begin = 29 + world.cells.len() * 2 + 1 + world.actors.len() * 200;
+        let bodies_begin = air_begin + world.air.nodes.len() * 12;
+        let motion_begin = bytes.len() - world.cells.len() * 8;
+        bytes[..air_begin].hash(&mut physical);
+        bytes[bodies_begin..motion_begin].hash(&mut physical);
+        timings.sort_unstable();
+        let ms = |t: Duration| t.as_secs_f64() * 1000.;
+        println!("{scene}: step mean={:.3}ms p95={:.3}ms max={:.3}ms; air={:.3}ms particles={:.3}ms bodies={:.3}ms actors={:.3}ms render={:.3}ms; state={:016x} trajectory={:016x} physical={:016x}",
+            timings.iter().map(|&t| ms(t)).sum::<f64>() / 240., ms(timings[228]), ms(timings[239]), ms(stages[0])/240., ms(stages[1])/240., ms(stages[2])/240., ms(stages[3])/240., ms(render)/240., hash.finish(), trajectory.finish(), physical.finish());
+    }
     Ok(())
 }
 /// Fixed, repeatable heavy scenes. Setup is outside timings; no SDL/window is involved.
@@ -900,6 +1030,40 @@ fn benchmark_stress() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn threaded_gestures_and_payload_survive_immediate_shutdown() {
+        let mut app = App::threaded(World::new(WIDTH, HEIGHT)).unwrap();
+        app.runtime
+            .as_ref()
+            .unwrap()
+            .controls(Input::default(), true, Vec::new(), 3)
+            .unwrap();
+        let buttons = controls(0);
+        app.material = Material::Firework;
+        app.select_secondary = true;
+        let water = buttons
+            .iter()
+            .find(|(_, a)| *a == Action::Select(Material::Water))
+            .unwrap()
+            .0;
+        let path = PathBuf::from("unused");
+        app.press(1, water.x() + 5, water.y() + 5, &buttons, &path);
+        app.press(2, 700, 400, &buttons, &path);
+        app.release(2);
+        app.material = Material::Bubble;
+        app.press(3, 820, 400, &buttons, &path);
+        app.drag(3, 892, 472);
+        app.release(3);
+        let world = app.runtime.take().unwrap().finish().unwrap();
+        let (x, y) = grid(700, 400).unwrap();
+        let cell = world.cells[y as usize * WIDTH + x as usize];
+        assert_eq!(cell.material, Material::Firework);
+        assert_eq!(cell.life & 63, Material::Water as u8);
+        assert_eq!(world.brush_payload, Material::Water);
+        assert_eq!(world.bodies.len(), 1);
+        assert_eq!(world.bodies[0].kind, physics::BodyKind::Bubble);
+        assert!((world.bodies[0].radius - 15.).abs() < 1.);
+    }
     #[test]
     fn touch_mapping_handles_letterboxing() {
         assert_eq!(touch_point(0.5, 0.5), (600, 400));

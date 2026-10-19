@@ -1,6 +1,6 @@
 //! Original compact cellular sandbox. No upstream game code or assets are used.
 
-use crate::physics::{render_bodies, step_bodies, Air, Body, BodyKind, MAX_BODIES};
+use crate::physics::{clean_residue, render_bodies, step_bodies, Air, Body, BodyKind, MAX_BODIES};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
@@ -231,6 +231,7 @@ impl Material {
     pub fn is_cell(self) -> bool {
         !self.is_tool() && !self.is_object() && !matches!(self, Self::Player | Self::Fighter)
     }
+    #[inline(always)]
     fn density(self) -> u8 {
         match self {
             Self::Empty => 0,
@@ -270,6 +271,7 @@ impl Material {
                 | Self::Bird
         )
     }
+    #[inline(always)]
     fn movable(self) -> bool {
         self.density() < 255
     }
@@ -313,6 +315,13 @@ pub use actors::Actor;
 pub(crate) struct Motion {
     pub vx: f32,
     pub vy: f32,
+}
+
+struct MotionStep {
+    vx: f32,
+    vy: f32,
+    steps: i32,
+    fraction: f32,
 }
 
 // A chain reaction is spread across updates instead of freezing input in one giant tick.
@@ -363,6 +372,9 @@ pub struct World {
     visited: Vec<u32>,
     tick: u32,
     blasts_this_step: usize,
+    wind_quiet: bool,
+    #[cfg(test)]
+    reference_steps: bool,
     rng: u64,
 }
 
@@ -381,6 +393,9 @@ impl World {
             visited: vec![0; width * height],
             tick: 0,
             blasts_this_step: 0,
+            wind_quiet: false,
+            #[cfg(test)]
+            reference_steps: false,
             rng: 0x69d2_739b_b853_a451,
         }
     }
@@ -705,21 +720,40 @@ impl World {
         if cursor != bytes.len() {
             return Err(invalid());
         }
+        for node in &mut world.air.nodes {
+            node.vx = clean_residue(node.vx);
+            node.vy = clean_residue(node.vy);
+            node.pressure = clean_residue(node.pressure);
+        }
+        for motion in &mut world.motion {
+            motion.vx = clean_residue(motion.vx);
+            motion.vy = clean_residue(motion.vy);
+        }
         Ok(world)
     }
+    #[inline(always)]
     fn random(&mut self) -> u32 {
         self.rng ^= self.rng << 13;
         self.rng ^= self.rng >> 7;
         self.rng ^= self.rng << 17;
         (self.rng >> 16) as u32
     }
-    fn index(&self, x: i32, y: i32) -> Option<usize> {
-        (x >= 0 && y >= 0 && (x as usize) < self.width && (y as usize) < self.height).then_some(
-            (y.max(0) as usize)
-                .saturating_mul(self.width)
-                .saturating_add(x.max(0) as usize),
-        )
+    fn fast_paths(&self) -> bool {
+        #[cfg(test)]
+        if self.reference_steps {
+            return false;
+        }
+        true
     }
+    #[inline(always)]
+    fn index(&self, x: i32, y: i32) -> Option<usize> {
+        if (x as usize) < self.width && (y as usize) < self.height {
+            Some(y as usize * self.width + x as usize)
+        } else {
+            None
+        }
+    }
+    #[inline(always)]
     pub fn at(&self, x: i32, y: i32) -> Material {
         self.index(x, y)
             .map(|i| self.cells[i].material)
@@ -910,16 +944,21 @@ impl World {
             r as f32,
         );
     }
+    #[inline(always)]
     fn exchange(&mut self, i: usize, x: i32, y: i32, rising: bool) -> bool {
         let Some(j) = self.index(x, y) else {
             return false;
         };
+        self.exchange_at(i, j, rising)
+    }
+    #[inline(always)]
+    fn exchange_at(&mut self, i: usize, j: usize, rising: bool) -> bool {
         let a = self.cells[i].material;
         let b = self.cells[j].material;
         let allowed = if rising {
             b == Material::Empty
         } else {
-            b.movable() && a.density() > b.density()
+            a.density() > b.density()
         };
         if allowed {
             self.cells.swap(i, j);
@@ -1108,6 +1147,89 @@ impl World {
             )
         })
     }
+    #[inline(always)]
+    fn integrate_motion(&mut self, i: usize, x: i32, y: i32, coupling: f32) -> Option<MotionStep> {
+        if self.wind_quiet && self.motion[i].vx == 0. && self.motion[i].vy == 0. {
+            self.motion[i] = Motion::default();
+            return None;
+        }
+        let (ax, ay) = if self.wind_quiet {
+            (0., 0.)
+        } else {
+            self.air.sample_pixel(x as usize, y as usize)
+        };
+        let v = &mut self.motion[i];
+        v.vx = (v.vx * 0.96 + (ax - v.vx) * coupling).clamp(-24., 24.);
+        v.vy = (v.vy * 0.96 + (ay - v.vy) * coupling).clamp(-24., 24.);
+        v.vx = clean_residue(v.vx);
+        v.vy = clean_residue(v.vy);
+        let (raw_x, raw_y) = (v.vx, v.vy);
+        let fast = self.fast_paths();
+        let (vx, vy) = if fast && raw_x.abs() + raw_y.abs() <= 3.5 {
+            // This conservative L1 bound is below the 3.8-pixel length cap.
+            // Avoid squaring tiny currents when the norm cannot change the result.
+            (raw_x, raw_y)
+        } else {
+            // One component is at least 1.75 here. A component below 1e-18
+            // cannot affect its squared sum at f32 precision; omitting that
+            // product also avoids generating subnormal intermediate results.
+            let xx = if fast && raw_x.abs() < 1e-18 {
+                0.
+            } else {
+                raw_x * raw_x
+            };
+            let yy = if fast && raw_y.abs() < 1e-18 {
+                0.
+            } else {
+                raw_y * raw_y
+            };
+            let speed_squared = xx + yy;
+            if speed_squared > 3.8 * 3.8 {
+                let scale = 3.8 / speed_squared.sqrt();
+                (raw_x * scale, raw_y * scale)
+            } else {
+                (raw_x, raw_y)
+            }
+        };
+        let distance = vx.abs().max(vy.abs());
+        let steps = distance.ceil() as i32;
+        if steps == 0 {
+            return None;
+        }
+        let fraction = (self.random() & 65535) as f32 / 65536.;
+        Some(MotionStep {
+            vx,
+            vy,
+            steps,
+            fraction,
+        })
+    }
+    #[inline(always)]
+    fn enclosed_motion(&mut self, i: usize, step: MotionStep) {
+        let dx = step.vx * step.steps as f32 / step.steps as f32 + step.fraction;
+        let dy = step.vy * step.steps as f32 / step.steps as f32 + step.fraction;
+        if !(0. ..1.).contains(&dx) || !(0. ..1.).contains(&dy) {
+            self.motion[i].vx *= 0.15;
+            self.motion[i].vy *= 0.15;
+        }
+    }
+    #[inline(always)]
+    fn uniformly_enclosed(&self, i: usize, x: i32, y: i32, material: Material) -> bool {
+        x > 0
+            && y > 0
+            && x + 1 < self.width as i32
+            && y + 1 < self.height as i32
+            && [
+                i - 1,
+                i + 1,
+                i - self.width,
+                i + self.width,
+                i + self.width - 1,
+                i + self.width + 1,
+            ]
+            .iter()
+            .all(|&j| self.cells[j].material == material)
+    }
     fn transport_particle(
         &mut self,
         mut i: usize,
@@ -1119,7 +1241,6 @@ impl World {
             self.motion[i] = Motion::default();
             return (i, x, y);
         }
-        let (ax, ay) = self.air.sample_pixel(x as usize, y as usize);
         let coupling = if m.density() <= 1 {
             0.20
         } else if m == Material::Mercury || m == Material::Stone {
@@ -1127,25 +1248,29 @@ impl World {
         } else {
             0.075
         };
-        let v = &mut self.motion[i];
-        v.vx = (v.vx * 0.96 + (ax - v.vx) * coupling).clamp(-24., 24.);
-        v.vy = (v.vy * 0.96 + (ay - v.vy) * coupling).clamp(-24., 24.);
-        let speed_squared = v.vx * v.vx + v.vy * v.vy;
-        let (vx, vy) = if speed_squared > 3.8 * 3.8 {
-            let scale = 3.8 / speed_squared.sqrt();
-            (v.vx * scale, v.vy * scale)
-        } else {
-            (v.vx, v.vy)
+        let Some(step) = self.integrate_motion(i, x, y, coupling) else {
+            return (i, x, y);
         };
-        let distance = vx.abs().max(vy.abs());
-        let steps = distance.ceil() as i32;
-        if steps == 0 {
+        if self.fast_paths()
+            && x > 0
+            && y > 0
+            && x + 1 < self.width as i32
+            && y + 1 < self.height as i32
+            && [i - 1, i + 1, i - self.width, i + self.width]
+                .iter()
+                .all(|&j| self.cells[j].material != Material::Empty)
+        {
+            self.enclosed_motion(i, step);
             return (i, x, y);
         }
+        let MotionStep {
+            vx,
+            vy,
+            steps,
+            fraction,
+        } = step;
         let start_x = x;
         let start_y = y;
-        // Randomized fractional displacement preserves subpixel flow without allocating positions.
-        let fraction = (self.random() & 65535) as f32 / 65536.;
         for n in 1..=steps {
             let tx = start_x + (vx * n as f32 / steps as f32 + fraction).floor() as i32;
             let ty = start_y + (vy * n as f32 / steps as f32 + fraction).floor() as i32;
@@ -1176,13 +1301,27 @@ impl World {
         (i, x, y)
     }
     pub fn step(&mut self, input: Input) {
+        self.advance::<false>(input);
+    }
+    pub fn step_profiled(&mut self, input: Input) -> [std::time::Duration; 4] {
+        self.advance::<true>(input)
+    }
+    fn advance<const PROFILE: bool>(&mut self, input: Input) -> [std::time::Duration; 4] {
         self.blasts_this_step = 0;
         self.tick = self.tick.wrapping_add(1);
         if self.tick == 0 {
             self.visited.fill(0);
             self.tick = 1;
         }
+        let start = PROFILE.then(std::time::Instant::now);
+        for motion in &mut self.motion {
+            motion.vx = clean_residue(motion.vx);
+            motion.vy = clean_residue(motion.vy);
+        }
         self.air.step(self.width, self.height, &self.cells);
+        self.wind_quiet =
+            self.fast_paths() && self.air.nodes.iter().all(|n| n.vx == 0. && n.vy == 0.);
+        let air_done = PROFILE.then(std::time::Instant::now);
         for y in (0..self.height as i32).rev() {
             let backwards = self.random() & 1 == 0;
             for n in 0..self.width {
@@ -1205,6 +1344,33 @@ impl World {
                     continue;
                 }
                 let dir = if self.random() & 1 == 0 { -1 } else { 1 };
+                if self.fast_paths()
+                    && matches!(
+                        m,
+                        Material::Water
+                            | Material::Oil
+                            | Material::Sand
+                            | Material::Gunpowder
+                            | Material::Stone
+                            | Material::Seed
+                            | Material::Salt
+                            | Material::SaltWater
+                            | Material::Mercury
+                    )
+                    && (!matches!(m, Material::SaltWater | Material::Mercury)
+                        || self.cells[i].life == 0)
+                    && self.uniformly_enclosed(i, x, y, m)
+                {
+                    let coupling = if matches!(m, Material::Stone | Material::Mercury) {
+                        0.015
+                    } else {
+                        0.075
+                    };
+                    if let Some(step) = self.integrate_motion(i, x, y, coupling) {
+                        self.enclosed_motion(i, step);
+                    }
+                    continue;
+                }
                 let (i, x, y) = self.transport_particle(i, x, y, m);
                 let neighbors = [(x, y - 1), (x + dir, y), (x - dir, y), (x, y + 1)];
                 if self.step_new_material(i, x, y, m, dir, &neighbors) {
@@ -1384,6 +1550,7 @@ impl World {
                 }
             }
         }
+        let particles_done = PROFILE.then(std::time::Instant::now);
         step_bodies(
             &mut self.bodies,
             &mut self.cells,
@@ -1391,7 +1558,19 @@ impl World {
             self.height,
             &mut self.air,
         );
+        let bodies_done = PROFILE.then(std::time::Instant::now);
         self.step_actors(input);
+        if PROFILE {
+            let end = std::time::Instant::now();
+            [
+                air_done.unwrap() - start.unwrap(),
+                particles_done.unwrap() - air_done.unwrap(),
+                bodies_done.unwrap() - particles_done.unwrap(),
+                end - bodies_done.unwrap(),
+            ]
+        } else {
+            [std::time::Duration::ZERO; 4]
+        }
     }
     /// Pressure painting is separate from material painting for negative-pressure AIR strokes.
     pub fn apply_pressure(&mut self, x: i32, y: i32, radius: i32, amount: f32) {
@@ -1451,6 +1630,7 @@ impl World {
         });
         match m {
             Fan => {
+                self.wind_quiet = false;
                 let (dx, dy) =
                     [(1., 0.), (0., 1.), (-1., 0.), (0., -1.)][(self.cells[i].life % 4) as usize];
                 self.air
@@ -1817,13 +1997,36 @@ impl World {
     }
 
     fn fall_liquid(&mut self, i: usize, x: i32, y: i32, dir: i32) {
-        if self.exchange(i, x, y + 1, false)
-            || self.exchange(i, x + dir, y + 1, false)
-            || self.exchange(i, x - dir, y + 1, false)
-        {
-            return;
+        if self.fast_paths() && x > 0 && x + 1 < self.width as i32 && y + 1 < self.height as i32 {
+            // These neighbors are already in bounds. Preserve exactly the same order
+            // of density exchanges without recomputing four x/y grid addresses.
+            let below = i + self.width;
+            let material = self.cells[i].material;
+            let density = material.density();
+            for j in [
+                below,
+                (below as isize + dir as isize) as usize,
+                (below as isize - dir as isize) as usize,
+                (i as isize + dir as isize) as usize,
+            ] {
+                let other = self.cells[j].material;
+                if other != material && density > other.density() {
+                    self.cells.swap(i, j);
+                    self.motion.swap(i, j);
+                    self.visited[i] = self.tick;
+                    self.visited[j] = self.tick;
+                    return;
+                }
+            }
+        } else {
+            if self.exchange(i, x, y + 1, false)
+                || self.exchange(i, x + dir, y + 1, false)
+                || self.exchange(i, x - dir, y + 1, false)
+            {
+                return;
+            }
+            self.exchange(i, x + dir, y, false);
         }
-        self.exchange(i, x + dir, y, false);
     }
     fn step_actors(&mut self, input: Input) {
         actors::step(
@@ -1835,6 +2038,16 @@ impl World {
             input,
             self.tick,
         );
+    }
+    /// Copy only presentation data; simulation buffers remain owned by the worker.
+    pub fn copy_visual_from(&mut self, other: &Self) {
+        assert_eq!((self.width, self.height), (other.width, other.height));
+        self.cells.copy_from_slice(&other.cells);
+        self.air.nodes.copy_from_slice(&other.air.nodes);
+        self.actors.clone_from(&other.actors);
+        self.bodies.clone_from(&other.bodies);
+        self.brush_payload = other.brush_payload;
+        self.tick = other.tick;
     }
     pub fn render(&self, pixels: &mut [u32]) {
         assert_eq!(pixels.len(), self.cells.len());
@@ -1858,6 +2071,243 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dense_fast_paths_preserve_complete_state_through_wind_blasts_and_edits() {
+        for scene in 0..3 {
+            let make = || {
+                let mut w = World::new(80, 64);
+                w.cells.fill(Cell::new(Material::Water));
+                if scene >= 1 {
+                    for y in 20..30 {
+                        for x in 30..40 {
+                            w.cells[y * 80 + x] = Cell::new(Material::Nitro);
+                        }
+                    }
+                    w.apply_pressure(35, 25, 10, 10.);
+                }
+                if scene == 2 {
+                    for x in 8..70 {
+                        w.cells[50 * 80 + x] = Cell::new(Material::Wall);
+                    }
+                    for (x, m) in [
+                        (10, Material::Salt),
+                        (15, Material::Magma),
+                        (20, Material::Sand),
+                        (25, Material::Oil),
+                        (45, Material::Fire),
+                    ] {
+                        w.cells[10 * 80 + x] = Cell::new(m);
+                    }
+                    w.bodies.push(Body::new(BodyKind::Wheel, 65., 40., 5.));
+                    w.actors.push(Actor::new(65., 20., Material::Player));
+                }
+                w.motion[3] = Motion { vx: -0., vy: -0. };
+                w
+            };
+            let mut optimized = make();
+            let mut reference = make();
+            reference.reference_steps = true;
+            for tick in 0..160 {
+                for w in [&mut optimized, &mut reference] {
+                    if tick == 30 {
+                        w.set(40, 40, Material::Fan);
+                    }
+                    if tick == 60 {
+                        w.paint_line(10, 35, 65, 35, 0, Material::Empty);
+                    }
+                    if tick == 90 {
+                        w.air.add_wind(60., 15., -4., 2., 20.);
+                    }
+                    if tick == 120 {
+                        w.drag_at(50, 25, 3, -2, 6);
+                    }
+                }
+                let input = Input {
+                    left: tick % 30 < 10,
+                    right: tick % 30 >= 20,
+                    jump: tick % 40 == 0,
+                };
+                optimized.step(input);
+                reference.step(input);
+                assert_eq!(
+                    optimized.cells, reference.cells,
+                    "scene={scene} tick={tick} cells"
+                );
+                assert_eq!(
+                    optimized.motion, reference.motion,
+                    "scene={scene} tick={tick} momentum"
+                );
+                assert_eq!(
+                    optimized.air.nodes, reference.air.nodes,
+                    "scene={scene} tick={tick} wind"
+                );
+                assert_eq!(
+                    optimized.rng, reference.rng,
+                    "scene={scene} tick={tick} random state"
+                );
+            }
+            let p =
+                std::env::temp_dir().join(format!("powder-exact-{}-{scene}", std::process::id()));
+            let q = p.with_extension("reference");
+            optimized.save(&p).unwrap();
+            reference.save(&q).unwrap();
+            assert_eq!(
+                std::fs::read(&p).unwrap(),
+                std::fs::read(&q).unwrap(),
+                "complete saved state scene={scene}"
+            );
+            std::fs::remove_file(p).unwrap();
+            std::fs::remove_file(q).unwrap();
+        }
+    }
+    #[test]
+    fn old_saves_and_updates_clear_subnormal_air_and_momentum() {
+        let mut w = World::new(32, 32);
+        w.cells.fill(Cell::new(Material::Water));
+        for node in &mut w.air.nodes {
+            node.vx = f32::from_bits(1);
+            node.vy = -f32::from_bits(500);
+            node.pressure = f32::from_bits(900);
+        }
+        for motion in &mut w.motion {
+            motion.vx = -f32::from_bits(12);
+            motion.vy = f32::from_bits(300);
+        }
+        let path = std::env::temp_dir().join(format!("powder-subnormal-{}", std::process::id()));
+        w.save(&path).unwrap();
+        let loaded = World::load(&path).unwrap();
+        assert!(loaded
+            .air
+            .nodes
+            .iter()
+            .all(|n| n.vx == 0. && n.vy == 0. && n.pressure == 0.));
+        assert!(loaded.motion.iter().all(|m| *m == Motion::default()));
+        w.step(Input::default());
+        assert!(w
+            .air
+            .nodes
+            .iter()
+            .all(|n| n.vx == 0. && n.vy == 0. && n.pressure == 0.));
+        assert!(w.motion.iter().all(|m| *m == Motion::default()));
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn uniform_passive_regions_match_reference_with_wind_heat_and_conductors() {
+        for material in [
+            Material::Water,
+            Material::Oil,
+            Material::Sand,
+            Material::Gunpowder,
+            Material::Stone,
+            Material::Seed,
+            Material::Salt,
+            Material::SaltWater,
+            Material::Mercury,
+        ] {
+            let mut a = World::new(32, 32);
+            let mut b = World::new(32, 32);
+            a.cells.fill(Cell::new(material));
+            b.cells.clone_from(&a.cells);
+            b.reference_steps = true;
+            for tick in 0..64 {
+                for w in [&mut a, &mut b] {
+                    if tick == 10 {
+                        w.air.add_wind(16., 16., 5., -2., 16.);
+                    }
+                    if tick == 20 && matches!(material, Material::SaltWater | Material::Mercury) {
+                        w.cells[16 * 32 + 16].life = 136;
+                    }
+                    if tick == 30 {
+                        w.set(16, 17, Material::Fire);
+                    }
+                    if tick == 40 {
+                        w.paint_line(8, 14, 23, 14, 0, Material::Empty);
+                    }
+                }
+                a.step(Input::default());
+                b.step(Input::default());
+                assert_eq!(a.cells, b.cells, "{material:?} tick={tick}");
+                assert_eq!(a.motion, b.motion, "{material:?} tick={tick}");
+                assert_eq!(a.air.nodes, b.air.nodes, "{material:?} tick={tick}");
+                assert_eq!(a.rng, b.rng, "{material:?} tick={tick}");
+            }
+        }
+    }
+    #[test]
+    fn velocity_length_shortcut_is_bit_exact_for_tiny_and_large_components() {
+        let mut a = World::new(16, 16);
+        let mut b = World::new(16, 16);
+        b.reference_steps = true;
+        let values = [
+            0., -0., 1e-40, -1e-40, 1e-30, -1e-30, 1e-20, -1e-20, 1e-10, -1e-10, 0.001, -0.001, 1.,
+            -1., 2., -2., 3.5, -3.5, 3.8, -3.8, 12., -12., 24., -24.,
+        ];
+        for x in values {
+            for y in values {
+                a.motion[17] = Motion { vx: x, vy: y };
+                b.motion[17] = a.motion[17];
+                a.rng = 0x123456789abcdef;
+                b.rng = a.rng;
+                let signature = |step: Option<MotionStep>| {
+                    step.map(|s| {
+                        (
+                            s.vx.to_bits(),
+                            s.vy.to_bits(),
+                            s.steps,
+                            s.fraction.to_bits(),
+                        )
+                    })
+                };
+                assert_eq!(
+                    signature(a.integrate_motion(17, 1, 1, 0.075)),
+                    signature(b.integrate_motion(17, 1, 1, 0.075)),
+                    "vx={x} vy={y}"
+                );
+                assert_eq!(a.rng, b.rng);
+            }
+        }
+    }
+    #[test]
+    fn enclosed_particle_shortcut_matches_swept_collisions() {
+        let mut a = World::new(32, 32);
+        let mut b = World::new(32, 32);
+        a.cells.fill(Cell::new(Material::Water));
+        b.cells.clone_from(&a.cells);
+        b.reference_steps = true;
+        let i = 16 * 32 + 16;
+        for x in -48..=48 {
+            for y in -48..=48 {
+                let motion = Motion {
+                    vx: x as f32 * 0.5,
+                    vy: y as f32 * 0.5,
+                };
+                a.motion[i] = motion;
+                b.motion[i] = motion;
+                a.rng = (x + 50) as u64 * 65537 + (y + 50) as u64;
+                b.rng = a.rng;
+                assert_eq!(
+                    a.transport_particle(i, 16, 16, Material::Water),
+                    b.transport_particle(i, 16, 16, Material::Water)
+                );
+                assert_eq!(a.motion[i], b.motion[i], "vx={x} vy={y}");
+                assert_eq!(a.rng, b.rng);
+            }
+        }
+    }
+    #[test]
+    fn grid_index_rejects_negative_and_extreme_coordinates() {
+        let w = World::new(16, 18);
+        for y in [i32::MIN, -1, 0, 15, 16, 17, 18, i32::MAX] {
+            for x in [i32::MIN, -1, 0, 15, 16, 17, 18, i32::MAX] {
+                let expected = if (0..16).contains(&x) && (0..18).contains(&y) {
+                    Some(y as usize * 16 + x as usize)
+                } else {
+                    None
+                };
+                assert_eq!(w.index(x, y), expected);
+            }
+        }
+    }
     #[test]
     fn chain_reactions_have_a_per_update_budget_and_resume_after_saving() {
         let mut world = World::new(96, 64);

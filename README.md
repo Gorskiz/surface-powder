@@ -28,7 +28,7 @@ Native gameplay on the Surface Pro 4, with touch controls and a saved sandbox sc
 - Six-joint players and fighters with foot-driven movement, floppy limbs and flying, shrinking body fragments on elimination.
 - Brush sizing, neon trails, airflow view, touch controls, and an interactive starter scene.
 - Automatic scene persistence, including wind and object state.
-- Physics targets 60 Hz; overloaded scenes yield to input and rendering instead of accumulating catch-up work. Native rendering is capped at approximately 30 frames per second.
+- Physics runs on its own worker targeting 60 Hz, independently of input and rendering. Native rendering is capped at approximately 30 frames per second.
 - No browser, game engine, account or network connection required to play.
 
 The palette includes powder, water, fire, seeds, gunpowder, fans, ice,
@@ -129,6 +129,7 @@ cargo fmt --check
 cargo clippy --locked -- -D warnings
 cargo run --release --locked -- --benchmark
 cargo run --release --locked -- --benchmark-stress
+cargo run --release --locked -- --benchmark-dense
 ```
 
 On macOS, use the same `RUSTFLAGS` setting from the build command for commands
@@ -148,33 +149,63 @@ On Unix, SIGUSR1 captures `preview.ppm` alongside the saved world.
 
 ## Performance
 
-The simulation keeps compact two-byte material cells plus eight bytes of particle momentum
-per cell, a coarse air grid, and a maximum
-of 128 moving objects. It does not add physics-engine dependencies. Use
-`--benchmark` to measure simulation plus pixel rendering on your hardware;
-that benchmark excludes SDL presentation and UI drawing. Large active scenes
-can slow simulation time on older hardware. Catch-up work yields after a 12 ms
-simulation budget (checked between complete updates). Large chain reactions
-process at most 64 detonations per update, preserving pending detonations in
-saves and allowing the reaction to propagate over subsequent updates.
+The simulation keeps two-byte material cells plus eight bytes of momentum per
+cell, a coarse air grid, and at most 128 moving objects. Particle density does
+not change the 400×300 grid or the material rules.
 
-`--benchmark-stress` runs three deterministic workloads: 91,600 occupied cells
-of powder/water and floor, plus separate 6,144-charge nitro and C4 chains. It
-reports mean, 95th-percentile and worst simulation update times separately
-from pixel rendering. Scene setup, SDL presentation and UI drawing are excluded.
-This is more representative of heavy gameplay than the starter-scene benchmark.
+Dense, uniform regions use an equivalent collision path that preserves the
+momentum calculations and random draws while omitting impossible exchanges.
+Air at exactly zero velocity and pressure waits until a fan, brush or explosion
+reactivates it. Regression tests compare these paths with a reference update,
+including wind, heat, conductive liquids, drawing, dragging and complete saves.
 
-Local macOS release measurements for this optimization (not Surface measurements):
+A long-running scene can accumulate IEEE subnormal floating-point residue,
+which causes severe arithmetic slowdowns on older Intel CPUs. Subnormal air
+and particle momentum (magnitudes below approximately 1.18×10⁻³⁸) are cleared
+on load and during updates. This intentional numerical cleanup changes those
+residual values and can change random-state hashes of older scenes.
 
-| Workload | Before | After |
-| --- | ---: | ---: |
-| Dense powder/water, mean update | 7.14 ms | 4.28 ms |
-| Nitro chain, worst update | 67.72 ms | 2.11 ms |
-| C4 chain, worst update | 67.76 ms | 1.97 ms |
+`--benchmark` measures the starter scene. `--benchmark-stress` measures a dense
+powder/water scene and separate nitro/C4 chains. `--benchmark-dense` measures a
+full 120,000-cell water scene and water with 2,500 nitro charges injected every
+60 updates. It reports mean, 95th-percentile and maximum update times, stage
+breakdowns, rendering time and state/trajectory digests. All benchmarks exclude
+SDL presentation and UI drawing; setup is outside timed updates.
 
-Chain-reaction peaks improve both through cheaper blast calculations and by
-spreading detonations across updates. Dense-scene rendered checksums remain
-identical. Timings vary with hardware, scene composition and system load.
+To profile an existing save without modifying it:
+
+```sh
+cargo run --release --locked -- --benchmark-dense --world /path/to/world.bin
+```
+
+Physics runs on a dedicated worker targeting 60 Hz, with the same ordered
+particle updates. Input and native presentation run independently at approximately
+30 FPS and read the latest available snapshot without waiting for physics.
+Drawing, object creation and saves remain ordered on the worker; shutdown waits
+for pending edits before saving the actual simulation. `--profile-frames` logs
+presentation frame intervals, including SDL work and frame pacing.
+
+Measured on the Debian Surface Pro 4 (240 updates per case):
+
+| Scene | Previous mean | Optimized mean | Optimized p95 | Optimized max |
+| --- | ---: | ---: | ---: | ---: |
+| Full-screen water | 19.68 ms | 4.35 ms | 5.12 ms | 6.49 ms |
+| Existing dense liquid save | 115.34 ms | 4.28 ms | 5.00 ms | 6.13 ms |
+| Water + repeated 2,500-charge explosions | — | 18.92 ms | 21.92 ms | 27.74 ms |
+
+A separate 300-frame Wayland/OpenGL run with full-screen water and an initial
+2,500-charge explosion held approximately 30 FPS: frame intervals averaged
+33.13 ms, with a 34.06 ms maximum. This is one measured workload, not an
+unlimited-load guarantee.
+
+These are simulation timings, excluding presentation. Full-water state and
+trajectory digests match the reference update exactly. Existing saves can differ
+because of the subnormal cleanup described above. The repeated-explosion case
+still exceeds the 16.67 ms budget for 60 physics updates per second. Separating
+presentation prevents an expensive physics update from blocking the UI; it does
+not make the simulation instantaneous. Chain reactions retain the existing
+64-detonation-per-update budget and save pending detonations. Extreme workloads
+can still slow simulation; finite hardware cannot guarantee zero latency.
 
 ## License
 

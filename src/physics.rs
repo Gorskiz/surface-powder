@@ -9,6 +9,18 @@ pub struct AirCell {
     pub pressure: f32,
 }
 
+/// IEEE subnormal residue cannot produce a meaningful world-space force, but can
+/// make scalar arithmetic dramatically slower on older Intel CPUs.
+#[inline]
+pub(crate) fn clean_residue(value: f32) -> f32 {
+    let magnitude = value.to_bits() & 0x7fff_ffff;
+    if magnitude != 0 && magnitude < 0x0080_0000 {
+        0.
+    } else {
+        value
+    }
+}
+
 const AIR_DIRECTIONS: [(isize, isize); 8] = [
     (-1, 0),
     (1, 0),
@@ -255,6 +267,20 @@ impl Air {
         {
             return;
         }
+        for node in &mut self.nodes {
+            node.vx = clean_residue(node.vx);
+            node.vy = clean_residue(node.vy);
+            node.pressure = clean_residue(node.pressure);
+        }
+        // Zero velocity/pressure is a fixed point for every obstacle layout.
+        // Rebuild the geometry lazily when a fan, brush or blast wakes the air.
+        if self
+            .nodes
+            .iter()
+            .all(|n| n.vx.to_bits() == 0 && n.vy.to_bits() == 0 && n.pressure.to_bits() == 0)
+        {
+            return;
+        }
         self.rebuild_obstacles(width, height, cells);
         self.scratch.copy_from_slice(&self.nodes);
         // Carry momentum forward before solving pressure. Diffusion alone makes a
@@ -334,6 +360,9 @@ impl Air {
                 self.scratch[i].vx = (self.scratch[i].vx * 0.999).clamp(-12., 12.);
                 self.scratch[i].vy = (self.scratch[i].vy * 0.999).clamp(-12., 12.);
                 self.scratch[i].pressure = (self.scratch[i].pressure * 0.999).clamp(-20., 20.);
+                self.scratch[i].vx = clean_residue(self.scratch[i].vx);
+                self.scratch[i].vy = clean_residue(self.scratch[i].vy);
+                self.scratch[i].pressure = clean_residue(self.scratch[i].pressure);
             }
         }
         std::mem::swap(&mut self.nodes, &mut self.scratch);
@@ -829,6 +858,42 @@ pub fn render_bodies(bodies: &[Body], pixels: &mut [u32], width: usize, height: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resting_air_wakes_with_current_obstacles_after_edits() {
+        let mut cached = super::Air::new(64, 64);
+        let mut fresh = super::Air::new(64, 64);
+        let mut cells = vec![super::Cell::new(super::Material::Empty); 64 * 64];
+        for _ in 0..20 {
+            cached.step(64, 64, &cells);
+        }
+        for y in 0..64 {
+            cells[y * 64 + 32] = super::Cell::new(super::Material::Wall);
+        }
+        cached.add_pressure(20., 32., 10., 12.);
+        fresh.add_pressure(20., 32., 10., 12.);
+        for _ in 0..20 {
+            cached.step(64, 64, &cells);
+            fresh.step(64, 64, &cells);
+            assert_eq!(cached.nodes, fresh.nodes);
+        }
+    }
+    #[test]
+    fn residue_cleanup_changes_only_subnormal_floats() {
+        for bits in [1, 0x007f_ffff, 0x8000_0001, 0x807f_ffff] {
+            assert_eq!(super::clean_residue(f32::from_bits(bits)).to_bits(), 0);
+        }
+        for bits in [
+            0,
+            0x8000_0000,
+            0x0080_0000,
+            0x8080_0000,
+            0x3f80_0000,
+            0xbf80_0000,
+        ] {
+            assert_eq!(super::clean_residue(f32::from_bits(bits)).to_bits(), bits);
+        }
+    }
+
     #[test]
     fn integer_particle_sampling_matches_full_sampler_at_every_pixel() {
         let mut air = super::Air::new(83, 69);
