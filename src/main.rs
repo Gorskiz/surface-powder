@@ -569,6 +569,9 @@ fn draw(
 }
 fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|s| s == "--benchmark-stress") {
+        return benchmark_stress();
+    }
     if args.iter().any(|s| s == "--benchmark") {
         return benchmark();
     }
@@ -723,10 +726,11 @@ fn main() -> Result<(), String> {
         if app.paused {
             last_step = frame;
         } else {
-            // Fixed simulation clock matches the original's 60 Hz independently of presentation.
-            // Bound catch-up so a stalled renderer cannot queue unbounded physics work.
+            // Target 60 Hz, but yield to input/rendering after 12 ms of simulation.
+            // Expensive scenes slow simulation time instead of stacking four slow ticks.
+            let simulation_started = Instant::now();
             let mut steps = 0;
-            while frame.duration_since(last_step) >= step_time && steps < 4 {
+            while frame.duration_since(last_step) >= step_time && steps < 2 {
                 let strokes: Vec<_> = app.pointers.values().copied().collect();
                 for stroke in strokes {
                     app.pour(stroke);
@@ -734,8 +738,11 @@ fn main() -> Result<(), String> {
                 app.world.step(input);
                 last_step += step_time;
                 steps += 1;
+                if simulation_started.elapsed() >= Duration::from_millis(12) {
+                    break;
+                }
             }
-            if steps == 4 {
+            if frame.duration_since(last_step) >= step_time {
                 last_step = frame;
             }
         }
@@ -822,6 +829,72 @@ fn benchmark() -> Result<(), String> {
         start.elapsed().as_secs_f64() * 1000. / 900.,
         std::mem::size_of_val(world.cells.as_slice())
     );
+    Ok(())
+}
+/// Fixed, repeatable heavy scenes. Setup is outside timings; no SDL/window is involved.
+fn benchmark_stress() -> Result<(), String> {
+    for scene in ["dense-particles", "nitro-chain", "c4-chain"] {
+        let mut durations = Vec::new();
+        let mut render_time = Duration::ZERO;
+        let mut peak_particles = 0;
+        let mut checksum = 0u64;
+        for _ in 0..3 {
+            let mut world = World::new(WIDTH, HEIGHT);
+            world.paint_line(0, 295, 399, 295, 0, Material::Wall);
+            if scene == "dense-particles" {
+                for y in 10..250 {
+                    world.paint_line(
+                        10,
+                        y,
+                        389,
+                        y,
+                        0,
+                        if y % 3 == 0 {
+                            Material::Water
+                        } else {
+                            Material::Sand
+                        },
+                    );
+                }
+                world.air.add_wind(60., 140., 9., -4., 90.);
+            } else {
+                let material = if scene == "nitro-chain" {
+                    Material::Nitro
+                } else {
+                    Material::C4
+                };
+                for y in 100..164 {
+                    world.paint_line(152, y, 247, y, 0, material);
+                }
+                world.paint_line(150, 163, 151, 163, 0, Material::Fire);
+                if material == Material::Nitro {
+                    world.apply_pressure(200, 130, 40, 10.);
+                }
+            }
+            let mut pixels = vec![0; WIDTH * HEIGHT];
+            for _ in 0..120 {
+                peak_particles = peak_particles.max(
+                    world
+                        .cells
+                        .iter()
+                        .filter(|c| c.material != Material::Empty)
+                        .count(),
+                );
+                let start = Instant::now();
+                world.step(Input::default());
+                durations.push(start.elapsed());
+                let start = Instant::now();
+                world.render(&mut pixels);
+                render_time += start.elapsed();
+                checksum = checksum.wrapping_add(pixels.iter().map(|&p| p as u64).sum::<u64>());
+            }
+        }
+        durations.sort_unstable();
+        let ms = |d: Duration| d.as_secs_f64() * 1000.;
+        let total: Duration = durations.iter().sum();
+        println!("{scene}: occupied={peak_particles}; step mean={:.3}ms p95={:.3}ms max={:.3}ms; render mean={:.3}ms; checksum={checksum}",
+            ms(total) / durations.len() as f64, ms(durations[durations.len() * 95 / 100]), ms(*durations.last().unwrap()), ms(render_time) / durations.len() as f64);
+    }
     Ok(())
 }
 #[cfg(test)]

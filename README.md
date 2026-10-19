@@ -28,7 +28,7 @@ Native gameplay on the Surface Pro 4, with touch controls and a saved sandbox sc
 - Six-joint players and fighters with foot-driven movement, floppy limbs and flying, shrinking body fragments on elimination.
 - Brush sizing, neon trails, airflow view, touch controls, and an interactive starter scene.
 - Automatic scene persistence, including wind and object state.
-- Fixed 60 Hz physics with native rendering capped at approximately 30 frames per second.
+- Physics targets 60 Hz; overloaded scenes yield to input and rendering instead of accumulating catch-up work. Native rendering is capped at approximately 30 frames per second.
 - No browser, game engine, account or network connection required to play.
 
 The palette includes powder, water, fire, seeds, gunpowder, fans, ice,
@@ -128,6 +128,7 @@ cargo test --locked
 cargo fmt --check
 cargo clippy --locked -- -D warnings
 cargo run --release --locked -- --benchmark
+cargo run --release --locked -- --benchmark-stress
 ```
 
 On macOS, use the same `RUSTFLAGS` setting from the build command for commands
@@ -152,7 +153,28 @@ per cell, a coarse air grid, and a maximum
 of 128 moving objects. It does not add physics-engine dependencies. Use
 `--benchmark` to measure simulation plus pixel rendering on your hardware;
 that benchmark excludes SDL presentation and UI drawing. Large active scenes
-can reduce frame rate on older hardware.
+can slow simulation time on older hardware. Catch-up work yields after a 12 ms
+simulation budget (checked between complete updates). Large chain reactions
+process at most 64 detonations per update, preserving pending detonations in
+saves and allowing the reaction to propagate over subsequent updates.
+
+`--benchmark-stress` runs three deterministic workloads: 91,600 occupied cells
+of powder/water and floor, plus separate 6,144-charge nitro and C4 chains. It
+reports mean, 95th-percentile and worst simulation update times separately
+from pixel rendering. Scene setup, SDL presentation and UI drawing are excluded.
+This is more representative of heavy gameplay than the starter-scene benchmark.
+
+Local macOS release measurements for this optimization (not Surface measurements):
+
+| Workload | Before | After |
+| --- | ---: | ---: |
+| Dense powder/water, mean update | 7.14 ms | 4.28 ms |
+| Nitro chain, worst update | 67.72 ms | 2.11 ms |
+| C4 chain, worst update | 67.76 ms | 1.97 ms |
+
+Chain-reaction peaks improve both through cheaper blast calculations and by
+spreading detonations across updates. Dense-scene rendered checksums remain
+identical. Timings vary with hardware, scene composition and system load.
 
 ## License
 

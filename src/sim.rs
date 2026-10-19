@@ -315,6 +315,42 @@ pub(crate) struct Motion {
     pub vy: f32,
 }
 
+// A chain reaction is spread across updates instead of freezing input in one giant tick.
+const MAX_BLASTS_PER_STEP: usize = 64;
+struct BlastPoint {
+    dx: i32,
+    dy: i32,
+    vx: f32,
+    vy: f32,
+    ray: Vec<(i32, i32)>,
+}
+fn make_blast_stencil(radius: i32) -> Vec<BlastPoint> {
+    let mut points = Vec::new();
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            if dx * dx + dy * dy > radius * radius {
+                continue;
+            }
+            let distance = ((dx * dx + dy * dy) as f32).sqrt();
+            let force = (1. - distance / (radius as f32 + 1.)) * 9.;
+            let steps = dx.abs().max(dy.abs());
+            points.push(BlastPoint {
+                dx,
+                dy,
+                vx: dx as f32 / distance.max(1.) * force,
+                vy: dy as f32 / distance.max(1.) * force,
+                ray: (1..=steps)
+                    .map(|n| (dx * n / steps, dy * n / steps))
+                    .collect(),
+            });
+        }
+    }
+    points
+}
+fn permanent_barrier(m: Material) -> bool {
+    matches!(m, Material::Wall | Material::Metal | Material::Clone)
+}
+
 pub struct World {
     pub width: usize,
     pub height: usize,
@@ -326,6 +362,7 @@ pub struct World {
     pub(crate) motion: Vec<Motion>,
     visited: Vec<u32>,
     tick: u32,
+    blasts_this_step: usize,
     rng: u64,
 }
 
@@ -343,6 +380,7 @@ impl World {
             motion: vec![Motion::default(); width * height],
             visited: vec![0; width * height],
             tick: 0,
+            blasts_this_step: 0,
             rng: 0x69d2_739b_b853_a451,
         }
     }
@@ -933,6 +971,15 @@ impl World {
             self.bomb_collapse(x, y);
             return;
         }
+        if self.blasts_this_step >= MAX_BLASTS_PER_STEP {
+            // These four materials otherwise have no use for life=1. It survives saves.
+            if let Some(i) = self.index(x, y) {
+                self.cells[i].life = 1;
+                self.visited[i] = self.tick;
+            }
+            return;
+        }
+        self.blasts_this_step += 1;
         self.air.add_pressure(
             x as f32,
             y as f32,
@@ -945,38 +992,56 @@ impl World {
             },
             radius,
         );
-        // A blast pushes existing particles; it must not erase a disk of sand/water.
-        // Rays stop at permanent barriers, protecting material on their far side.
-        for dy in -r..=r {
-            for dx in -r..=r {
-                let distance = (dx as f32).hypot(dy as f32);
-                if distance > radius || !self.blast_visible(x, y, x + dx, y + dy) {
-                    continue;
+        static STENCIL: std::sync::OnceLock<Vec<BlastPoint>> = std::sync::OnceLock::new();
+        let fallback;
+        let points = if r == 10 {
+            STENCIL.get_or_init(|| make_blast_stencil(10)).as_slice()
+        } else {
+            fallback = make_blast_stencil(r);
+            &fallback
+        };
+        // Most blasts are in open air. Only trace rays if this region contains a shield.
+        let x0 = (x - r).max(0) as usize;
+        let x1 = (x + r + 1).min(self.width as i32).max(0) as usize;
+        let y0 = (y - r).max(0) as usize;
+        let y1 = (y + r + 1).min(self.height as i32).max(0) as usize;
+        let shielded = x < r
+            || y < r
+            || x + r >= self.width as i32
+            || y + r >= self.height as i32
+            || (y0..y1).any(|row| {
+                self.cells[row * self.width + x0..row * self.width + x1]
+                    .iter()
+                    .any(|c| permanent_barrier(c.material))
+            });
+        for point in points {
+            let Some(i) = self.index(x + point.dx, y + point.dy) else {
+                continue;
+            };
+            let m = self.cells[i].material;
+            if m == Material::Empty {
+                continue;
+            }
+            if shielded
+                && point
+                    .ray
+                    .iter()
+                    .any(|&(dx, dy)| permanent_barrier(self.at(x + dx, y + dy)))
+            {
+                continue;
+            }
+            if m == Material::Glass {
+                self.set(x + point.dx, y + point.dy, Material::Sand);
+            } else if m == Material::Gas && source == Material::Gas {
+                if self.random() % 100 == 0 {
+                    self.set(x + point.dx, y + point.dy, Material::Fire);
                 }
-                let Some(i) = self.index(x + dx, y + dy) else {
-                    continue;
-                };
-                let m = self.cells[i].material;
-                let force = (1. - distance / (radius + 1.)) * 9.;
-                if m == Material::Glass {
-                    self.set(x + dx, y + dy, Material::Sand);
-                } else if m == Material::Gas && source == Material::Gas {
-                    if self.random() % 100 == 0 {
-                        self.set(x + dx, y + dy, Material::Fire);
-                    }
-                } else if m == Material::C4 && dx.abs() <= 1 && dy.abs() <= 1 {
-                    self.cells[i].life = 1;
-                }
-                if source != Material::Gas
-                    && self.cells[i].material.movable()
-                    && self.cells[i].material != Material::Empty
-                {
-                    let norm = distance.max(1.);
-                    self.motion[i].vx =
-                        (self.motion[i].vx + dx as f32 / norm * force).clamp(-24., 24.);
-                    self.motion[i].vy =
-                        (self.motion[i].vy + dy as f32 / norm * force).clamp(-24., 24.);
-                }
+            } else if m == Material::C4 && point.dx.abs() <= 1 && point.dy.abs() <= 1 {
+                self.cells[i].life = 1;
+            }
+            if source != Material::Gas && self.cells[i].material.movable() {
+                self.motion[i].vx = (self.motion[i].vx + point.vx).clamp(-24., 24.);
+                self.motion[i].vy = (self.motion[i].vy + point.vy).clamp(-24., 24.);
             }
         }
         self.set(
@@ -1054,7 +1119,7 @@ impl World {
             self.motion[i] = Motion::default();
             return (i, x, y);
         }
-        let (ax, ay, _) = self.air.sample(x as f32, y as f32);
+        let (ax, ay) = self.air.sample_pixel(x as usize, y as usize);
         let coupling = if m.density() <= 1 {
             0.20
         } else if m == Material::Mercury || m == Material::Stone {
@@ -1065,9 +1130,13 @@ impl World {
         let v = &mut self.motion[i];
         v.vx = (v.vx * 0.96 + (ax - v.vx) * coupling).clamp(-24., 24.);
         v.vy = (v.vy * 0.96 + (ay - v.vy) * coupling).clamp(-24., 24.);
-        let travel = v.vx.hypot(v.vy).max(3.8) / 3.8;
-        let vx = v.vx / travel;
-        let vy = v.vy / travel;
+        let speed_squared = v.vx * v.vx + v.vy * v.vy;
+        let (vx, vy) = if speed_squared > 3.8 * 3.8 {
+            let scale = 3.8 / speed_squared.sqrt();
+            (v.vx * scale, v.vy * scale)
+        } else {
+            (v.vx, v.vy)
+        };
         let distance = vx.abs().max(vy.abs());
         let steps = distance.ceil() as i32;
         if steps == 0 {
@@ -1107,6 +1176,7 @@ impl World {
         (i, x, y)
     }
     pub fn step(&mut self, input: Input) {
+        self.blasts_this_step = 0;
         self.tick = self.tick.wrapping_add(1);
         if self.tick == 0 {
             self.visited.fill(0);
@@ -1123,6 +1193,15 @@ impl World {
                 }
                 let m = self.cells[i].material;
                 if m == Material::Empty {
+                    continue;
+                }
+                if self.cells[i].life == 1
+                    && matches!(
+                        m,
+                        Material::Gunpowder | Material::Gas | Material::C4 | Material::Nitro
+                    )
+                {
+                    self.explode(x, y, 10);
                     continue;
                 }
                 let dir = if self.random() & 1 == 0 { -1 } else { 1 };
@@ -1335,6 +1414,11 @@ impl World {
         ns: &[(i32, i32); 4],
     ) -> bool {
         use Material::*;
+        // The original material group has its own dispatch below; avoid four hot-neighbor
+        // reads and the extended chemistry dispatch for every ordinary sand/water grain.
+        if (m as u8) < Fan as u8 {
+            return false;
+        }
         if matches!(m, Mercury | SaltWater) && self.cells[i].life > 0 {
             self.cells[i].life = self.cells[i].life.saturating_sub(1);
             if self.cells[i].life > 128 && self.random() % 3 == 0 {
@@ -1775,11 +1859,62 @@ impl World {
 mod tests {
     use super::*;
     #[test]
+    fn chain_reactions_have_a_per_update_budget_and_resume_after_saving() {
+        let mut world = World::new(96, 64);
+        for y in 0..5 {
+            for x in 0..20 {
+                let i = (10 + y * 3) * 96 + 10 + x * 3;
+                world.cells[i] = Cell {
+                    material: Material::C4,
+                    life: 1,
+                };
+            }
+        }
+        world.step(Input::default());
+        assert_eq!(world.blasts_this_step, MAX_BLASTS_PER_STEP);
+        assert_eq!(
+            world
+                .cells
+                .iter()
+                .filter(|c| c.material == Material::C4)
+                .count(),
+            100 - MAX_BLASTS_PER_STEP
+        );
+        let path =
+            std::env::temp_dir().join(format!("surface-pending-blasts-{}.sav", std::process::id()));
+        world.save(&path).unwrap();
+        let mut loaded = World::load(&path).unwrap();
+        loaded.step(Input::default());
+        assert!(!loaded.cells.iter().any(|c| c.material == Material::C4));
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn deferred_explosives_detonate_without_remaining_next_to_fire() {
+        let mut world = World::new(96, 64);
+        world.blasts_this_step = MAX_BLASTS_PER_STEP;
+        for (x, material) in [
+            (10, Material::Gunpowder),
+            (30, Material::Gas),
+            (50, Material::Nitro),
+            (70, Material::C4),
+        ] {
+            world.set(x, 20, material);
+            world.explode(x, 20, 10);
+            assert_eq!(world.cells[20 * 96 + x as usize].life, 1);
+        }
+        world.step(Input::default());
+        assert_eq!(world.blasts_this_step, 4);
+        assert!(!world.cells.iter().any(|c| matches!(
+            c.material,
+            Material::Gunpowder | Material::Gas | Material::Nitro | Material::C4
+        )));
+    }
+    #[test]
     fn blast_preserves_powder_and_gives_outward_momentum() {
         let mut w = World::new(64, 64);
         w.set(37, 32, Material::Sand);
         w.set(27, 32, Material::Water);
-        w.explode(32, 32, 12);
+        w.explode(32, 32, 10);
         assert_eq!(w.at(37, 32), Material::Sand);
         assert_eq!(w.at(27, 32), Material::Water);
         assert!(w.motion[32 * 64 + 37].vx > 3.);
@@ -1798,7 +1933,7 @@ mod tests {
         let mut w = World::new(64, 64);
         w.paint_line(34, 0, 34, 63, 0, Material::Wall);
         w.set(37, 32, Material::Sand);
-        w.explode(32, 32, 12);
+        w.explode(32, 32, 10);
         assert_eq!(w.motion[32 * 64 + 37], Motion::default());
         w.motion[32 * 64 + 37] = Motion { vx: -20., vy: 0. };
         w.step(Input::default());

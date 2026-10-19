@@ -113,6 +113,43 @@ impl Air {
         }
         (result.vx, result.vy, result.pressure)
     }
+    /// Integer particle coordinates on the four-pixel air grid avoid floating-point
+    /// floor/clamp conversions and unused pressure interpolation for every grain.
+    pub fn sample_pixel(&self, x: usize, y: usize) -> (f32, f32) {
+        if self.cell_size != 4 {
+            let (vx, vy, _) = self.sample(x as f32, y as f32);
+            return (vx, vy);
+        }
+        let px = x.saturating_sub(2);
+        let py = y.saturating_sub(2);
+        let x0 = (px / 4).min(self.cols - 1);
+        let y0 = (py / 4).min(self.rows - 1);
+        let x1 = (x0 + 1).min(self.cols - 1);
+        let y1 = (y0 + 1).min(self.rows - 1);
+        let tx = if x0 + 1 == self.cols {
+            0.
+        } else {
+            (px % 4) as f32 * 0.25
+        };
+        let ty = if y0 + 1 == self.rows {
+            0.
+        } else {
+            (py % 4) as f32 * 0.25
+        };
+        let mut vx = 0.;
+        let mut vy = 0.;
+        for (cx, cy, weight) in [
+            (x0, y0, (1. - tx) * (1. - ty)),
+            (x1, y0, tx * (1. - ty)),
+            (x0, y1, (1. - tx) * ty),
+            (x1, y1, tx * ty),
+        ] {
+            let node = self.nodes[cy * self.cols + cx];
+            vx += node.vx * weight;
+            vy += node.vy * weight;
+        }
+        (vx, vy)
+    }
     fn rebuild_obstacles(&mut self, width: usize, height: usize, cells: &[Cell]) {
         let mut changed = !self.obstacles_valid || self.obstacle_pixels.len() != cells.len();
         self.obstacle_pixels.resize(cells.len(), false);
@@ -792,6 +829,21 @@ pub fn render_bodies(bodies: &[Body], pixels: &mut [u32], width: usize, height: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn integer_particle_sampling_matches_full_sampler_at_every_pixel() {
+        let mut air = super::Air::new(83, 69);
+        for (i, n) in air.nodes.iter_mut().enumerate() {
+            n.vx = (i as f32 * 0.13).sin() * 9.;
+            n.vy = (i as f32 * 0.37).cos() * 8.;
+        }
+        for y in 0..69 {
+            for x in 0..83 {
+                let (vx, vy, _) = air.sample(x as f32, y as f32);
+                assert_eq!(air.sample_pixel(x, y), (vx, vy));
+            }
+        }
+    }
+
     use super::*;
     #[test]
     fn pressure_creates_local_flow_and_wall_seals_it() {
